@@ -16,7 +16,7 @@
         </div>
       </div>
 
-      <el-table v-loading="loading" :data="rows">
+      <el-table class="desktop-data-table" v-loading="loading" :data="rows">
         <el-table-column label="实例" min-width="230">
           <template #default="{ row }">
             <div class="software-cell">
@@ -57,6 +57,40 @@
           </template>
         </el-table-column>
       </el-table>
+
+      <div v-loading="loading" class="mobile-card-list software-mobile-list">
+        <article v-for="row in rows" :key="row.softwareId" class="mobile-record-card software-record-card">
+          <div class="mobile-record-head">
+            <div class="software-cell">
+              <span class="software-badge"><el-icon><Box /></el-icon></span>
+              <div>
+                <strong>{{ row.name }}</strong>
+                <span>{{ row.softwareId }}</span>
+              </div>
+            </div>
+            <el-tag :type="row.force ? 'danger' : 'primary'" effect="light">{{ row.force ? '强制更新' : '提示更新' }}</el-tag>
+          </div>
+          <div class="mobile-record-meta">
+            <span><b>当前版本</b><em>{{ row.version || '未设置' }}</em></span>
+            <span><b>最低版本</b><em>{{ row.lowVersion || '不限' }}</em></span>
+            <span><b>访问</b><em>{{ row.visit || 0 }}</em></span>
+            <span><b>密钥</b><em>{{ maskSecret(row.instanceKey) }}</em></span>
+          </div>
+          <div class="mobile-record-note">
+            <span>公告</span>
+            <em>{{ row.notice || '暂无公告' }}</em>
+          </div>
+          <div class="mobile-record-actions">
+            <el-button v-if="canEdit" size="small" :icon="EditPen" @click="edit(row)">编辑</el-button>
+            <el-button size="small" :icon="CopyDocument" @click="copy(row.softwareId)">复制 ID</el-button>
+            <el-button size="small" :icon="CopyDocument" @click="copy(row.instanceKey)">复制密钥</el-button>
+            <el-button size="small" :icon="DocumentCopy" @click="copyClientConfig(row)">复制配置</el-button>
+            <el-button v-if="canDelete" size="small" type="danger" :icon="Delete" @click="remove(row)">删除</el-button>
+          </div>
+        </article>
+        <el-empty v-if="!loading && rows.length === 0" description="暂无实例" />
+      </div>
+
       <el-pagination v-model:current-page="page.pageNum" v-model:page-size="page.limit" :total="page.count" layout="total, prev, pager, next" @current-change="load" />
     </div>
 

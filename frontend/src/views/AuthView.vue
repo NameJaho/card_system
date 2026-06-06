@@ -32,7 +32,7 @@
         <el-button v-if="canDeleteAuth" type="danger" :icon="Delete" :disabled="selected.length === 0" @click="batchDelete">批量删除</el-button>
       </div>
 
-      <el-table v-loading="loading" :data="rows" @selection-change="selected = $event">
+      <el-table class="desktop-data-table" v-loading="loading" :data="rows" @selection-change="selected = $event">
         <el-table-column v-if="canDeleteAuth" type="selection" width="44" />
         <el-table-column label="卡密" min-width="250">
           <template #default="{ row }">
@@ -84,6 +84,46 @@
           </template>
         </el-table-column>
       </el-table>
+
+      <div v-loading="loading" class="mobile-card-list auth-mobile-list">
+        <article v-for="row in rows" :key="row.authId" class="mobile-record-card auth-record-card">
+          <div class="mobile-record-head">
+            <div class="card-code mobile-card-code">
+              <strong>{{ row.authId }}</strong>
+              <span>{{ row.createTime }}</span>
+            </div>
+            <div class="mobile-record-status">
+              <el-checkbox v-if="canDeleteAuth" :model-value="isSelected(row)" @change="(checked) => toggleMobileSelect(row, checked)" />
+              <el-tag :type="statusTag(row)">{{ statusText(row) }}</el-tag>
+            </div>
+          </div>
+          <div class="mobile-record-meta">
+            <span><b>实例</b><em>{{ row.softwareId }}</em></span>
+            <span><b>设备</b><em>{{ row.macid || '未绑定' }}</em></span>
+            <span><b>换绑</b><em>{{ row.bindUsed || 0 }} / {{ row.bindCount ?? '不限' }}</em></span>
+            <span><b>到期</b><em>{{ row.endTime || '永久' }}</em></span>
+          </div>
+          <div class="mobile-record-note">
+            <span>备注</span>
+            <em>{{ row.remark || '无备注' }}</em>
+          </div>
+          <div v-if="showCreatorColumn" class="mobile-record-creator">
+            <span>创建者</span>
+            <div class="creator-cell" :class="{ 'creator-user-card': row.creatorRole === 'user' }">
+              <span>{{ creatorDisplayName(row) }}</span>
+              <el-tag :type="creatorTag(row)" effect="light">{{ creatorRoleText(row) }}</el-tag>
+            </div>
+          </div>
+          <div class="mobile-record-actions">
+            <el-button size="small" :icon="CopyDocument" @click="copy(row.authId)">复制</el-button>
+            <el-button v-if="canUnbindAuth" size="small" :icon="EditPen" @click="openRemark(row)">备注</el-button>
+            <el-button v-if="canUnbindAuth" size="small" :icon="Unlock" @click="openBind(row)">解绑</el-button>
+            <el-button v-if="canDeleteAuth" size="small" type="danger" :icon="Delete" @click="remove(row)">删除</el-button>
+          </div>
+        </article>
+        <el-empty v-if="!loading && rows.length === 0" description="暂无卡密" />
+      </div>
+
       <el-pagination
         v-model:current-page="page.pageNum"
         v-model:page-size="page.limit"
@@ -116,9 +156,31 @@
             <div class="form-grid compact-grid">
               <el-form-item label="生成数量">
                 <el-input-number v-model="createForm.createNumber" :min="1" :max="100" controls-position="right" />
+                <div class="quick-choice-row">
+                  <button
+                    v-for="value in quantityPresets"
+                    :key="value"
+                    type="button"
+                    :class="{ active: createForm.createNumber === value }"
+                    @click="createForm.createNumber = value"
+                  >
+                    {{ value }} 张
+                  </button>
+                </div>
               </el-form-item>
               <el-form-item label="换绑次数">
                 <el-input-number v-model="createForm.bindCount" :min="0" controls-position="right" placeholder="不限" />
+                <div class="quick-choice-row">
+                  <button
+                    v-for="item in bindPresets"
+                    :key="item.label"
+                    type="button"
+                    :class="{ active: createForm.bindCount === item.value }"
+                    @click="createForm.bindCount = item.value"
+                  >
+                    {{ item.label }}
+                  </button>
+                </div>
               </el-form-item>
             </div>
             <el-form-item label="有效期">
@@ -219,6 +281,13 @@ const durationPresets = [
   { label: '365 天', day: 365, hour: 0, minute: 0 },
   { label: '永久', day: 0, hour: 0, minute: 0 }
 ]
+const quantityPresets = [1, 5, 10, 20, 50]
+const bindPresets = [
+  { label: '不限', value: null },
+  { label: '0 次', value: 0 },
+  { label: '1 次', value: 1 },
+  { label: '3 次', value: 3 }
+]
 
 const selectedSoftwareName = computed(() => {
   const item = software.value.find((entry) => entry.softwareId === createForm.softwareId)
@@ -299,6 +368,7 @@ function search() {
 
 function resetSearch() {
   Object.assign(query, { keyword: '', softwareId: '', authId: '', macid: '', status: '' })
+  selected.value = []
   search()
 }
 
@@ -357,6 +427,18 @@ function handleRowAction(command, row) {
   if (command === 'remark') openRemark(row)
   if (command === 'bind') openBind(row)
   if (command === 'delete') remove(row)
+}
+
+function isSelected(row) {
+  return selected.value.some((item) => item.authId === row.authId)
+}
+
+function toggleMobileSelect(row, checked) {
+  if (checked && !isSelected(row)) {
+    selected.value = [...selected.value, row]
+  } else if (!checked) {
+    selected.value = selected.value.filter((item) => item.authId !== row.authId)
+  }
 }
 
 async function saveRemark() {

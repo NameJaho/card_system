@@ -25,7 +25,7 @@
         </div>
       </div>
 
-      <el-table :data="rows" v-loading="loading">
+      <el-table class="desktop-data-table" :data="rows" v-loading="loading">
         <el-table-column label="账号" min-width="230">
           <template #default="{ row }">
             <div class="account-cell">
@@ -70,6 +70,50 @@
           </template>
         </el-table-column>
       </el-table>
+
+      <div v-loading="loading" class="mobile-card-list proxy-mobile-list">
+        <article v-for="row in rows" :key="row.user" class="mobile-record-card proxy-record-card">
+          <div class="mobile-record-head">
+            <div class="account-cell">
+              <span class="account-avatar">{{ initialOf(row.user) }}</span>
+              <div>
+                <strong>{{ row.user }}</strong>
+                <span>{{ row.nick || '未设置昵称' }} · {{ row.email || '未设置邮箱' }}</span>
+              </div>
+            </div>
+            <el-tag :type="roleTag(row.role)" effect="light">{{ row.roleLabel || roleLabel(row.role) }}</el-tag>
+          </div>
+          <div class="mobile-record-meta">
+            <span><b>实例</b><em>{{ rowScopeLabel(row) }}</em></span>
+            <span><b>最近登录</b><em>{{ row.lastLogin || '从未登录' }}</em></span>
+            <span><b>创建时间</b><em>{{ row.time || '未知' }}</em></span>
+          </div>
+          <div class="mobile-chip-section">
+            <span>实例范围</span>
+            <div class="mini-chip-list">
+              <template v-if="row.softwareIds?.includes('*')">
+                <span>全部实例</span>
+              </template>
+              <template v-else>
+                <span v-for="name in rowScopePreview(row)" :key="name">{{ name }}</span>
+                <em v-if="rowScopeRest(row)">+{{ rowScopeRest(row) }}</em>
+              </template>
+            </div>
+          </div>
+          <div class="mobile-chip-section">
+            <span>权限</span>
+            <div class="permission-tags">
+              <el-tag v-for="label in rowPermissionPreview(row)" :key="label">{{ label }}</el-tag>
+              <span v-if="rowPermissionRest(row)" class="permission-more">+{{ rowPermissionRest(row) }} 项</span>
+            </div>
+          </div>
+          <div class="mobile-record-actions">
+            <el-button size="small" :icon="EditPen" @click="edit(row)">编辑</el-button>
+            <el-button size="small" type="danger" :icon="Delete" @click="remove(row)">删除</el-button>
+          </div>
+        </article>
+        <el-empty v-if="!loading && rows.length === 0" description="暂无账号" />
+      </div>
     </div>
 
     <el-dialog v-model="dialog.visible" class="proxy-dialog" width="960px" append-to-body destroy-on-close>
@@ -88,7 +132,10 @@
           <el-form label-position="top">
             <div class="panel-header">
               <h3>账号资料</h3>
-              <span>{{ dialog.isCreate ? '密码为必填项' : '密码留空则保持不变' }}</span>
+              <div class="panel-header-actions">
+                <span>{{ dialog.isCreate ? '密码为必填项' : '密码留空则保持不变' }}</span>
+                <el-button size="small" :icon="Refresh" @click="quickFillAccount">{{ dialog.isCreate ? '一键生成' : '生成新密码' }}</el-button>
+              </div>
             </div>
             <div class="form-grid">
               <el-form-item label="账号">
@@ -287,6 +334,23 @@ function resetForm() {
     role: availableRoleOptions.value[0]?.value || 'user',
     softwareIds: []
   })
+}
+
+function randomSuffix() {
+  return Math.random().toString(36).slice(2, 8)
+}
+
+function generatePassword() {
+  return `Kd${randomSuffix()}${Math.floor(1000 + Math.random() * 9000)}`
+}
+
+function quickFillAccount() {
+  if (dialog.isCreate && !form.user.trim()) form.user = `user_${randomSuffix()}`
+  if (dialog.isCreate && !form.nick.trim()) form.nick = roleLabel(form.role)
+  form.password = generatePassword()
+  if (isUserRole.value && form.softwareIds.length === 0 && software.value[0]) {
+    form.softwareIds = [software.value[0].softwareId]
+  }
 }
 
 function openCreate() {
