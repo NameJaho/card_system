@@ -1,0 +1,59 @@
+services:
+  mysql:
+    image: ${MYSQL_IMAGE:-mysql:8.4}
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-card_root_password}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-card_system}
+      MYSQL_USER: ${MYSQL_USER:-card_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-card_password}
+      TZ: ${TZ:-Asia/Shanghai}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-time-zone=+08:00
+    volumes:
+      - ${MYSQL_DATA_DIR:-./runtime/mysql}:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$${MYSQL_USER} -p$${MYSQL_PASSWORD} --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
+    environment:
+      CARD_DATABASE_URL: mysql+pymysql://${MYSQL_USER:-card_user}:${MYSQL_PASSWORD:-card_password}@mysql:3306/${MYSQL_DATABASE:-card_system}?charset=utf8mb4
+      CARD_SECRET_KEY: ${CARD_SECRET_KEY:-change-this-secret}
+      CARD_DEFAULT_ADMIN_USER: ${CARD_DEFAULT_ADMIN_USER:-admin}
+      CARD_DEFAULT_ADMIN_PASSWORD: ${CARD_DEFAULT_ADMIN_PASSWORD:-admin123456}
+      CARD_DEFAULT_ADMIN_EMAIL: ${CARD_DEFAULT_ADMIN_EMAIL:-admin@example.com}
+      CARD_ALLOW_DEV_RESET_LINK: ${CARD_ALLOW_DEV_RESET_LINK:-false}
+      TZ: ${TZ:-Asia/Shanghai}
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python - <<'PY'\nimport json, urllib.request\nwith urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5) as res:\n    data = json.loads(res.read().decode())\n    raise SystemExit(0 if data.get('success') else 1)\nPY"]
+      interval: 10s
+      timeout: 8s
+      retries: 30
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:22-alpine}
+        NGINX_IMAGE: ${NGINX_IMAGE:-nginx:1.27-alpine}
+    ports:
+      - "${CARD_HTTP_PORT:-8080}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
