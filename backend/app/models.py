@@ -48,6 +48,7 @@ class SoftwareInstance(Base):
     version: Mapped[str] = mapped_column(String(80), default="1.0.0")
     low_version: Mapped[str | None] = mapped_column(String(80), nullable=True)
     software_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    instance_key: Mapped[str] = mapped_column(String(80), default="", index=True)
     force: Mapped[bool] = mapped_column(Boolean, default=False)
     remark: Mapped[str] = mapped_column(Text, default="")
     url: Mapped[str | None] = mapped_column(Text, nullable=True)

@@ -170,15 +170,27 @@ token: <登录返回的 token>
 
 软件客户端接口统一前缀为 `/api/client`。
 
-完整接入流程和可运行示例见 [docs/client-integration.md](docs/client-integration.md)。项目内置 Python 标准库客户端：
+完整接入流程和可运行示例见 [docs/client-integration.md](docs/client-integration.md)。推荐客户端只引入 SDK，并通过配置文件维护项目名、服务地址、软件 ID、实例密钥和版本号。
 
-```bash
-python3 clients/python/keydesk_client.py \
-  --base-url http://127.0.0.1:8000 \
-  --software-id SWxxxx \
-  --auth-id KMxxxx \
-  --macid DEMO-MACHINE-1 \
-  verify
+配置模板：
+
+```text
+clients/python/keydesk-client.example.json
+```
+
+最小 Python 示例：
+
+```python
+from clients.python import KeyDeskApp, KeyDeskError
+
+app = KeyDeskApp.from_file("keydesk-client.json")
+
+try:
+    app.check_update()
+    card = app.require_license()
+    variables = app.cloud_variables()
+except KeyDeskError as exc:
+    print(f"授权失败: {exc}")
 ```
 
 检查更新：
@@ -190,6 +202,7 @@ POST /api/client/software/checkUpdate
 ```json
 {
   "softwareId": "SWxxxx",
+  "instanceKey": "IKxxxx",
   "version": "1.0.0",
   "macid": "DEVICE-001"
 }
@@ -204,6 +217,7 @@ POST /api/client/auth/activate
 ```json
 {
   "softwareId": "SWxxxx",
+  "instanceKey": "IKxxxx",
   "authId": "KMxxxx",
   "macid": "DEVICE-001"
 }
@@ -218,6 +232,7 @@ POST /api/client/auth/verify
 ```json
 {
   "softwareId": "SWxxxx",
+  "instanceKey": "IKxxxx",
   "authId": "KMxxxx",
   "macid": "DEVICE-001"
 }

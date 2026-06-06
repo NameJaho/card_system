@@ -1,0 +1,14 @@
+{
+  "projectName": "Demo Desktop App",
+  "baseUrl": "http://127.0.0.1:8080",
+  "softwareId": "SWxxxxxxxxxxxx",
+  "instanceKey": "IKxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "version": "1.0.0",
+  "authId": "",
+  "macid": "",
+  "licenseFile": ".keydesk-license.json",
+  "deviceFile": ".keydesk-device",
+  "timeout": 10,
+  "heartbeatInterval": 60,
+  "autoActivate": true
+}

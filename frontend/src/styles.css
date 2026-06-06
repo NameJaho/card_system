@@ -1351,6 +1351,27 @@ select {
   gap: 6px;
 }
 
+.secret-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  padding: 5px 7px;
+  border: 1px solid rgb(0 166 200 / 14%);
+  border-radius: 7px;
+  background: rgb(0 166 200 / 5%);
+}
+
+.secret-cell code {
+  min-width: 0;
+  max-width: 118px;
+  overflow: hidden;
+  color: #203744;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .mini-chip-list,
 .permission-tags,
 .scope-preview-list {

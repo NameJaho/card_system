@@ -36,12 +36,23 @@
             </div>
           </template>
         </el-table-column>
+        <el-table-column label="实例密钥" min-width="190">
+          <template #default="{ row }">
+            <div class="secret-cell">
+              <code>{{ maskSecret(row.instanceKey) }}</code>
+              <el-tooltip content="复制实例密钥" placement="top">
+                <el-button size="small" :icon="CopyDocument" circle @click="copy(row.instanceKey)" />
+              </el-tooltip>
+            </div>
+          </template>
+        </el-table-column>
         <el-table-column prop="visit" label="访问" width="90" />
         <el-table-column prop="notice" label="公告" show-overflow-tooltip />
-        <el-table-column label="操作" width="280" fixed="right">
+        <el-table-column label="操作" width="340" fixed="right">
           <template #default="{ row }">
             <el-button v-if="canEdit" size="small" :icon="EditPen" @click="edit(row)">编辑</el-button>
             <el-button size="small" :icon="CopyDocument" @click="copy(row.softwareId)">复制 ID</el-button>
+            <el-button size="small" :icon="DocumentCopy" @click="copyClientConfig(row)">复制配置</el-button>
             <el-button v-if="canDelete" size="small" type="danger" :icon="Delete" @click="remove(row)">删除</el-button>
           </template>
         </el-table-column>
@@ -75,6 +86,13 @@
                 <el-input v-model="form.softwareId" disabled>
                   <template #append>
                     <el-button :icon="CopyDocument" @click="copy(form.softwareId)" />
+                  </template>
+                </el-input>
+              </el-form-item>
+              <el-form-item v-if="!dialog.isCreate" label="实例密钥">
+                <el-input v-model="form.instanceKey" disabled>
+                  <template #append>
+                    <el-button :icon="CopyDocument" @click="copy(form.instanceKey)" />
                   </template>
                 </el-input>
               </el-form-item>
@@ -120,6 +138,7 @@
           <span class="summary-kicker">Client Config</span>
           <strong>{{ form.name || '新实例' }}</strong>
           <div class="summary-row"><span>实例 ID</span><em>{{ form.softwareId || '保存后生成' }}</em></div>
+          <div class="summary-row"><span>实例密钥</span><em>{{ form.instanceKey ? maskSecret(form.instanceKey) : '保存后生成' }}</em></div>
           <div class="summary-row"><span>当前版本</span><em>{{ form.version || '未设置' }}</em></div>
           <div class="summary-row"><span>最低版本</span><em>{{ form.lowVersion || '不限制' }}</em></div>
           <div class="summary-row"><span>更新策略</span><em>{{ form.force ? '强制更新' : '提示更新' }}</em></div>
@@ -129,6 +148,7 @@
             <code>/api/client/auth/verify</code>
           </div>
           <div class="summary-pulse"><i></i><span>配置待保存</span></div>
+          <el-button v-if="!dialog.isCreate" class="w-full" :icon="DocumentCopy" @click="copyClientConfig(form)">复制客户端配置</el-button>
         </aside>
       </div>
 
@@ -143,7 +163,7 @@
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { CopyDocument, Delete, EditPen, Finished, Plus, Refresh, Search } from '@element-plus/icons-vue'
+import { CopyDocument, Delete, DocumentCopy, EditPen, Finished, Plus, Refresh, Search } from '@element-plus/icons-vue'
 import { api, hasPermission } from '../services/api'
 
 const loading = ref(false)
@@ -152,7 +172,7 @@ const rows = ref([])
 const query = reactive({ softwareName: '', softwareId: '' })
 const page = reactive({ pageNum: 1, limit: 10, count: 0 })
 const dialog = reactive({ visible: false, isCreate: true })
-const form = reactive({ softwareId: '', name: '', version: '', lowVersion: '', md5: '', url: '', notice: '', remark: '', force: false })
+const form = reactive({ softwareId: '', instanceKey: '', name: '', version: '', lowVersion: '', md5: '', url: '', notice: '', remark: '', force: false })
 const versionPresets = ['1.0.0', '1.1.0', '2.0.0', '3.0.0']
 const canCreate = computed(() => hasPermission('softCreate'))
 const canEdit = computed(() => hasPermission('softEdit'))
@@ -184,7 +204,7 @@ function reset() {
 
 function openCreate() {
   dialog.isCreate = true
-  Object.assign(form, { softwareId: '', name: '', version: '1.0.0', lowVersion: '', md5: '', url: '', notice: '', remark: '', force: false })
+  Object.assign(form, { softwareId: '', instanceKey: '', name: '', version: '1.0.0', lowVersion: '', md5: '', url: '', notice: '', remark: '', force: false })
   dialog.visible = true
 }
 
@@ -192,6 +212,7 @@ function edit(row) {
   dialog.isCreate = false
   Object.assign(form, {
     softwareId: row.softwareId || '',
+    instanceKey: row.instanceKey || '',
     name: row.name || '',
     version: row.version || '',
     lowVersion: row.lowVersion || '',
@@ -264,6 +285,33 @@ function copy(text) {
   if (!text) return
   navigator.clipboard?.writeText(text)
   ElMessage.success('已复制')
+}
+
+function maskSecret(value) {
+  if (!value) return '未生成'
+  if (value.length <= 12) return value
+  return `${value.slice(0, 6)}...${value.slice(-6)}`
+}
+
+function clientConfig(row) {
+  return {
+    projectName: row.name || 'KeyDesk App',
+    baseUrl: window.location.origin,
+    softwareId: row.softwareId || '',
+    instanceKey: row.instanceKey || '',
+    version: row.version || '1.0.0',
+    authId: '',
+    macid: '',
+    licenseFile: '.keydesk-license.json',
+    deviceFile: '.keydesk-device',
+    timeout: 10,
+    heartbeatInterval: 60,
+    autoActivate: true
+  }
+}
+
+function copyClientConfig(row) {
+  copy(JSON.stringify(clientConfig(row), null, 2))
 }
 
 onMounted(load)

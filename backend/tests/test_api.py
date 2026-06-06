@@ -1,10 +1,17 @@
+import json
 import os
+import sys
 import tempfile
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 os.environ["CARD_DATABASE_URL"] = f"sqlite:///{tempfile.gettempdir()}/keydesk_api_test.db"
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from app.database import Base, SessionLocal, engine
 from app.main import app
@@ -52,6 +59,8 @@ def test_admin_and_client_auth_flow():
         assert software["success"] is True
         assert software["data"]
         software_id = software["data"][0]["softwareId"]
+        instance_key = software["data"][0]["instanceKey"]
+        assert instance_key.startswith("IK")
 
         created = client.post(
             "/api/adm/createAuth",
@@ -63,10 +72,17 @@ def test_admin_and_client_auth_flow():
 
         verify = client.post(
             "/api/client/auth/verify",
-            json={"softwareId": software_id, "authId": auth_id, "macid": "PYTEST-MACHINE"},
+            json={"softwareId": software_id, "instanceKey": instance_key, "authId": auth_id, "macid": "PYTEST-MACHINE"},
         ).json()
         assert verify["success"] is True
         assert verify["data"]["state"] == "active"
+
+        wrong_key = client.post(
+            "/api/client/auth/verify",
+            json={"softwareId": software_id, "instanceKey": "IK-WRONG", "authId": auth_id, "macid": "PYTEST-MACHINE"},
+        ).json()
+        assert wrong_key["success"] is False
+        assert wrong_key["message"] == "实例密钥错误"
 
         events = client.post("/api/adm/message/event", json={"page": {"pageNum": 1, "limit": 10}, "keyword": "verify"}, headers=headers).json()
         assert events["success"] is True
@@ -629,3 +645,68 @@ def test_blacklist_blocks_client_verify():
         ).json()
         assert blocked["success"] is False
         assert "黑名单" in blocked["message"]
+
+
+def test_python_sdk_config_file_and_state_helpers(tmp_path):
+    from clients.python import KeyDeskApp, KeyDeskConfigError
+
+    config_path = tmp_path / "keydesk-client.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "projectName": "SDK Demo",
+                "baseUrl": "http://127.0.0.1:8080",
+                "softwareId": "SWSDK",
+                "instanceKey": "IKSDK",
+                "version": "2.0.0",
+                "licenseFile": "state/license.json",
+                "deviceFile": "state/device.txt",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def check_update(self, software_id, version, macid, instance_key):
+            self.calls.append(("check_update", software_id, version, macid, instance_key))
+            return {"data": {"softwareId": software_id, "version": version, "force": False}}
+
+        def verify(self, software_id, auth_id, macid, instance_key):
+            self.calls.append(("verify", software_id, auth_id, macid, instance_key))
+            return {"data": {"authId": auth_id, "state": "active", "endTime": ""}}
+
+        def cloud_variables(self, software_id, instance_key):
+            self.calls.append(("cloud_variables", software_id, instance_key))
+            return {"data": [{"key": "feature_x", "value": "enabled"}]}
+
+        def heartbeat(self, software_id, customer_id, macid, instance_key):
+            self.calls.append(("heartbeat", software_id, customer_id, macid, instance_key))
+            return {"data": {"serverTime": "2026-06-07T00:00:00"}}
+
+    app = KeyDeskApp.from_file(config_path)
+    fake = FakeClient()
+    app.client = fake
+
+    assert app.config.project_name == "SDK Demo"
+    assert app.config.software_id == "SWSDK"
+    assert app.config.instance_key == "IKSDK"
+    assert app.check_update()["version"] == "2.0.0"
+    assert app.macid.startswith("KD-")
+
+    card = app.verify("KMSDK")
+    assert card["state"] == "active"
+    assert app.saved_auth_id() == "KMSDK"
+    assert json.loads((tmp_path / "state/license.json").read_text(encoding="utf-8"))["authId"] == "KMSDK"
+    assert app.cloud_variables() == {"feature_x": "enabled"}
+    assert app.heartbeat()["serverTime"] == "2026-06-07T00:00:00"
+
+    assert ("check_update", "SWSDK", "2.0.0", app.macid, "IKSDK") in fake.calls
+    assert ("verify", "SWSDK", "KMSDK", app.macid, "IKSDK") in fake.calls
+    assert ("cloud_variables", "SWSDK", "IKSDK") in fake.calls
+
+    with pytest.raises(KeyDeskConfigError):
+        KeyDeskApp.from_dict({"projectName": "bad", "baseUrl": "http://127.0.0.1:8080", "softwareId": "SWBAD"})

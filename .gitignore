@@ -9,4 +9,7 @@ dist/
 runtime/
 *.log
 *.csv
+.keydesk-device
+.keydesk-license.json
+keydesk-client.json
 coverage/

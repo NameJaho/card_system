@@ -114,6 +114,16 @@ def migrate_schema() -> None:
                 """
             )
         )
+    software_columns = {column["name"] for column in inspect(engine).get_columns("software_instances")}
+    if "instance_key" not in software_columns:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE software_instances ADD COLUMN instance_key VARCHAR(80) DEFAULT ''"))
+    with SessionLocal() as db:
+        rows = db.query(SoftwareInstance).filter(or_(SoftwareInstance.instance_key.is_(None), SoftwareInstance.instance_key == "")).all()
+        for row in rows:
+            row.instance_key = random_code("IK", 32)
+        if rows:
+            db.commit()
 
 
 def is_developer(user: AdminUser) -> bool:
@@ -217,6 +227,16 @@ def get_software_or_404(db: Session, user: AdminUser, software_id: str) -> Softw
 def software_owner_by_id(db: Session, software_id: str) -> int | None:
     row = db.query(SoftwareInstance).filter(SoftwareInstance.software_id == software_id).first()
     return row.owner_id if row else None
+
+
+def client_software_or_fail(db: Session, data: dict[str, Any]) -> tuple[SoftwareInstance | None, str]:
+    soft = db.query(SoftwareInstance).filter(SoftwareInstance.software_id == data.get("softwareId")).first()
+    if not soft:
+        return None, "实例不存在"
+    incoming_key = str(data.get("instanceKey") or data.get("privateKey") or "").strip()
+    if incoming_key and soft.instance_key and incoming_key != soft.instance_key:
+        return None, "实例密钥错误"
+    return soft, ""
 
 
 AUTH_STATUS_ALIASES = {
@@ -409,13 +429,13 @@ def software_list(body: AnyBody, user: AdminUser = Depends(require_permission("s
         q = q.filter(SoftwareInstance.name.contains(data["softwareName"]))
     if data.get("softwareId"):
         q = q.filter(SoftwareInstance.software_id.contains(data["softwareId"]))
-    return ok(paged(q, data.get("page"), software_dict))
+    return ok(paged(q, data.get("page"), lambda row: software_dict(row, include_secret=True)))
 
 
 @app.post("/api/adm/softwareSelect")
 def software_select(user: AdminUser = Depends(current_user), db: Session = Depends(get_db)):
     rows = visible_software_query(db, user).order_by(SoftwareInstance.created_at.desc()).all()
-    return ok([software_dict(row) for row in rows])
+    return ok([software_dict(row, include_secret=True) for row in rows])
 
 
 @app.post("/api/adm/createSoftware")
@@ -430,6 +450,7 @@ def create_software(body: AnyBody, db: Session = Depends(get_db), user: AdminUse
         name=data["name"],
         version=data["version"],
         software_id=random_code("SW", 12),
+        instance_key=random_code("IK", 32),
         low_version=data.get("lowVersion") or None,
         force=bool(data.get("force")),
         remark=str(data.get("remark") or ""),
@@ -439,7 +460,7 @@ def create_software(body: AnyBody, db: Session = Depends(get_db), user: AdminUse
     )
     db.add(row)
     db.commit()
-    return ok(software_dict(row), "创建成功")
+    return ok(software_dict(row, include_secret=True), "创建成功")
 
 
 @app.post("/api/adm/updateSoftware")
@@ -460,8 +481,10 @@ def update_software(body: AnyBody, db: Session = Depends(get_db), user: AdminUse
         if key in data:
             setattr(row, attr, data[key])
     row.updated_at = datetime.utcnow()
+    if not row.instance_key:
+        row.instance_key = random_code("IK", 32)
     db.commit()
-    return ok(software_dict(row))
+    return ok(software_dict(row, include_secret=True))
 
 
 @app.post("/api/adm/delSoftware")
@@ -851,9 +874,9 @@ def check_black_white(db: Session, owner_id: int, software_id: str, macid: str |
 @app.post("/api/client/software/checkUpdate")
 def client_check_update(body: AnyBody, request: Request, db: Session = Depends(get_db)):
     data = body_dict(body)
-    soft = db.query(SoftwareInstance).filter(SoftwareInstance.software_id == data.get("softwareId")).first()
+    soft, error = client_software_or_fail(db, data)
     if not soft:
-        return fail("实例不存在")
+        return fail(error)
     soft.visit += 1
     soft.lasttime = datetime.utcnow()
     add_event(db, soft.owner_id, "api", "checkUpdate", "检查更新", request, software_id=soft.software_id, macid=data.get("macid"))
@@ -864,7 +887,10 @@ def client_check_update(body: AnyBody, request: Request, db: Session = Depends(g
 @app.post("/api/client/auth/activate")
 def client_auth_activate(body: AnyBody, request: Request, db: Session = Depends(get_db)):
     data = body_dict(body)
-    card = db.query(AuthCard).filter(AuthCard.auth_id == data.get("authId"), AuthCard.software_id == data.get("softwareId")).first()
+    soft, error = client_software_or_fail(db, data)
+    if not soft:
+        return fail(error)
+    card = db.query(AuthCard).filter(AuthCard.auth_id == data.get("authId"), AuthCard.software_id == soft.software_id).first()
     if not card:
         return fail("卡密不存在")
     allowed, reason = check_black_white(db, card.owner_id, card.software_id, data.get("macid"))
@@ -890,7 +916,10 @@ def client_auth_activate(body: AnyBody, request: Request, db: Session = Depends(
 @app.post("/api/client/auth/verify")
 def client_auth_verify(body: AnyBody, request: Request, db: Session = Depends(get_db)):
     data = body_dict(body)
-    card = db.query(AuthCard).filter(AuthCard.auth_id == data.get("authId"), AuthCard.software_id == data.get("softwareId")).first()
+    soft, error = client_software_or_fail(db, data)
+    if not soft:
+        return fail(error)
+    card = db.query(AuthCard).filter(AuthCard.auth_id == data.get("authId"), AuthCard.software_id == soft.software_id).first()
     if not card:
         return fail("卡密不存在")
     allowed, reason = check_black_white(db, card.owner_id, card.software_id, data.get("macid"))
@@ -921,7 +950,10 @@ def client_auth_verify(body: AnyBody, request: Request, db: Session = Depends(ge
 @app.post("/api/client/auth/unbind")
 def client_auth_unbind(body: AnyBody, request: Request, db: Session = Depends(get_db)):
     data = body_dict(body)
-    card = db.query(AuthCard).filter(AuthCard.auth_id == data.get("authId"), AuthCard.software_id == data.get("softwareId")).first()
+    soft, error = client_software_or_fail(db, data)
+    if not soft:
+        return fail(error)
+    card = db.query(AuthCard).filter(AuthCard.auth_id == data.get("authId"), AuthCard.software_id == soft.software_id).first()
     if not card:
         return fail("卡密不存在")
     if card.macid != data.get("macid"):
@@ -935,19 +967,20 @@ def client_auth_unbind(body: AnyBody, request: Request, db: Session = Depends(ge
 @app.post("/api/client/cloudVariables/list")
 def client_cloud_vars(body: AnyBody, db: Session = Depends(get_db)):
     data = body_dict(body)
-    owner_id = software_owner_by_id(db, data.get("softwareId", ""))
-    if owner_id is None:
-        return fail("实例不存在")
-    rows = db.query(CloudVariable).filter(CloudVariable.owner_id == owner_id, CloudVariable.status == "y", CloudVariable.software_id.in_(["", data.get("softwareId")])).all()
+    soft, error = client_software_or_fail(db, data)
+    if not soft:
+        return fail(error)
+    rows = db.query(CloudVariable).filter(CloudVariable.owner_id == soft.owner_id, CloudVariable.status == "y", CloudVariable.software_id.in_(["", soft.software_id])).all()
     return ok([cloud_var_dict(row) for row in rows])
 
 
 @app.post("/api/client/user/register")
 def client_user_register(body: AnyBody, request: Request, db: Session = Depends(get_db)):
     data = body_dict(body)
-    owner_id = software_owner_by_id(db, data.get("softwareId", ""))
-    if owner_id is None:
-        return fail("实例不存在")
+    soft, error = client_software_or_fail(db, data)
+    if not soft:
+        return fail(error)
+    owner_id = soft.owner_id
     if db.query(Customer).filter(Customer.owner_id == owner_id, Customer.email == data.get("email")).first():
         return fail("邮箱已注册")
     customer = Customer(
@@ -967,7 +1000,10 @@ def client_user_register(body: AnyBody, request: Request, db: Session = Depends(
 @app.post("/api/client/user/login")
 def client_user_login(body: AnyBody, request: Request, db: Session = Depends(get_db)):
     data = body_dict(body)
-    owner_id = software_owner_by_id(db, data.get("softwareId", ""))
+    soft, error = client_software_or_fail(db, data)
+    if not soft:
+        return fail(error)
+    owner_id = soft.owner_id if soft else None
     customer = db.query(Customer).filter(Customer.owner_id == owner_id, Customer.email == data.get("email")).first() if owner_id else None
     if not customer or not verify_password(data.get("password") or "", customer.password_hash):
         return fail("邮箱或密码错误")
@@ -980,7 +1016,10 @@ def client_user_login(body: AnyBody, request: Request, db: Session = Depends(get
 @app.post("/api/client/user/heartbeat")
 def client_user_heartbeat(body: AnyBody, request: Request, db: Session = Depends(get_db)):
     data = body_dict(body)
-    owner_id = software_owner_by_id(db, data.get("softwareId", ""))
+    soft, error = client_software_or_fail(db, data)
+    if not soft:
+        return fail(error)
+    owner_id = soft.owner_id if soft else None
     add_event(db, owner_id, "api", "heartbeat", "用户心跳", request, software_id=data.get("softwareId"), customer_id=data.get("customerId"), macid=data.get("macid"))
     db.commit()
     return ok({"serverTime": datetime.utcnow().isoformat()})
@@ -989,7 +1028,10 @@ def client_user_heartbeat(body: AnyBody, request: Request, db: Session = Depends
 @app.post("/api/client/user/logout")
 def client_user_logout(body: AnyBody, request: Request, db: Session = Depends(get_db)):
     data = body_dict(body)
-    owner_id = software_owner_by_id(db, data.get("softwareId", ""))
+    soft, error = client_software_or_fail(db, data)
+    if not soft:
+        return fail(error)
+    owner_id = soft.owner_id if soft else None
     add_event(db, owner_id, "api", "userLogout", "用户退出", request, software_id=data.get("softwareId"), customer_id=data.get("customerId"))
     db.commit()
     return ok()

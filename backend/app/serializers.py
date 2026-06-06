@@ -39,8 +39,8 @@ def user_dict(user: AdminUser, include_private: bool = True) -> dict:
     return data
 
 
-def software_dict(row: SoftwareInstance) -> dict:
-    return {
+def software_dict(row: SoftwareInstance, include_secret: bool = False) -> dict:
+    data = {
         "_id": str(row.id),
         "id": row.id,
         "name": row.name,
@@ -57,6 +57,9 @@ def software_dict(row: SoftwareInstance) -> dict:
         "createTime": now_text(row.created_at),
         "lasttime": now_text(row.lasttime or row.updated_at),
     }
+    if include_secret:
+        data["instanceKey"] = row.instance_key or ""
+    return data
 
 
 def auth_dict(row: AuthCard) -> dict:

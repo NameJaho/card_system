@@ -39,6 +39,7 @@ def seed_database(db: Session) -> None:
             version="1.0.0",
             low_version="0.9.0",
             software_id=random_code("SW", 10),
+            instance_key=random_code("IK", 32),
             force=False,
             remark="默认演示实例",
             url="https://example.com/download/demo.zip",
