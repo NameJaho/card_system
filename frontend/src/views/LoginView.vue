@@ -48,6 +48,9 @@
             登录
           </el-button>
         </el-form>
+        <div class="smart-login-tip">
+          复制管理员分享的整段登录信息后，打开本页面可一键识别账号密码。
+        </div>
         <div class="login-links">
           <el-button link :loading="smartLoading" @click="smartLoginFromClipboard">一键识别登录</el-button>
           <el-button link @click="forgotVisible = true">找回密码</el-button>
@@ -59,7 +62,7 @@
         v-model="pasteText"
         type="textarea"
         :rows="7"
-        placeholder="粘贴管理员分享的整段登录信息，系统会自动识别账号和密码"
+        placeholder="粘贴管理员分享的整段登录信息，系统会自动识别账号和密码并登录"
       />
       <template #footer>
         <el-button @click="pasteVisible = false">取消</el-button>
@@ -128,7 +131,7 @@ function parseSharedCredentials(text) {
     return { user: userMatch[1].trim(), password: passwordMatch[1].trim() }
   }
   const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
-  const compact = lines.filter((line) => !/(登录地址|角色|实例范围|后台账号登录信息|尽快修改密码)/.test(line))
+  const compact = lines.filter((line) => !/(登录地址|角色|实例范围|后台账号登录信息|使用方式|安全提示|一键识别登录|修改密码)/.test(line))
   if (compact.length >= 2) return { user: compact[0], password: compact[1] }
   return null
 }
@@ -191,5 +194,12 @@ onMounted(() => {
   display: flex;
   justify-content: space-between;
   margin-top: 14px;
+}
+
+.smart-login-tip {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+  margin-top: 12px;
 }
 </style>

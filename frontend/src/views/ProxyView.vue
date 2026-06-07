@@ -303,12 +303,13 @@ const scopeSummary = computed(() => {
 const shareLoginUrl = computed(() => adminLoginUrl())
 const shareText = computed(() => [
   '后台账号登录信息',
+  '使用方式：复制本段内容，打开登录地址，点击“一键识别登录”即可自动登录。',
   `登录地址：${shareLoginUrl.value}`,
   `账号：${form.user || '未填写'}`,
   `密码：${form.password || '未设置'}`,
   `角色：${selectedRole.value?.label || '未选择'}`,
   `实例范围：${scopeSummary.value}`,
-  '登录后请尽快修改密码。'
+  '安全提示：登录后请尽快修改密码，不要把本段内容转发给无关人员。'
 ].join('\n'))
 const passwordSummary = computed(() => {
   if (dialog.isCreate) return form.password ? '已设置' : '未设置'
