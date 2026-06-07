@@ -67,38 +67,92 @@
         </router-view>
       </section>
     </main>
+    <div v-if="mobileMoreOpen" class="mobile-nav-scrim" @click="mobileMoreOpen = false"></div>
+    <section class="mobile-more-sheet" :class="{ open: mobileMoreOpen }" aria-label="更多导航">
+      <div class="mobile-more-handle"></div>
+      <div class="mobile-more-head">
+        <div>
+          <span class="summary-kicker">Navigation</span>
+          <strong>功能导航</strong>
+        </div>
+        <el-button :icon="CloseBold" circle @click="mobileMoreOpen = false" />
+      </div>
+      <div class="mobile-more-grid">
+        <router-link
+          v-for="item in overflowMobileNavItems"
+          :key="item.path"
+          :to="item.path"
+          class="mobile-more-item"
+          @click="mobileMoreOpen = false"
+        >
+          <el-icon><component :is="item.icon" /></el-icon>
+          <span>{{ item.label }}</span>
+        </router-link>
+      </div>
+    </section>
+    <nav class="mobile-dock" aria-label="移动端主导航">
+      <router-link
+        v-for="item in primaryMobileNavItems"
+        :key="item.path"
+        :to="item.path"
+        class="mobile-dock-item"
+        @click="mobileMoreOpen = false"
+      >
+        <el-icon><component :is="item.icon" /></el-icon>
+        <span>{{ item.mobileLabel || item.label }}</span>
+      </router-link>
+      <button type="button" class="mobile-dock-item mobile-dock-more" :class="{ active: isMoreActive || mobileMoreOpen }" @click="mobileMoreOpen = !mobileMoreOpen">
+        <el-icon><Menu /></el-icon>
+        <span>更多</span>
+      </button>
+    </nav>
   </div>
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { useRoute } from 'vue-router'
-import { Key, Refresh } from '@element-plus/icons-vue'
+import { CloseBold, Key, Menu, Refresh } from '@element-plus/icons-vue'
 import { hasAnyPermission, hasPermission, session } from './services/api'
 
 const route = useRoute()
+const mobileMoreOpen = ref(false)
 const user = computed(() => session.user || '未登录')
 const userInitial = computed(() => user.value.slice(0, 1).toUpperCase())
 const roleLabel = computed(() => session.roleLabel || '未授权')
 
 const allNavItems = [
-  { path: '/dashboard', label: '我的数据', icon: 'DataAnalysis' },
-  { path: '/softWare', label: '实例列表', icon: 'Box', permission: 'softView' },
-  { path: '/auth', label: '网络验证', icon: 'Key', permissionAny: ['authCreate', 'authDelete', 'authExport', 'authUnbind'] },
-  { path: '/customer', label: '用户管理', icon: 'User', permission: 'userView' },
+  { path: '/dashboard', label: '我的数据', mobileLabel: '数据', icon: 'DataAnalysis' },
+  { path: '/softWare', label: '实例列表', mobileLabel: '实例', icon: 'Box', permission: 'softView' },
+  { path: '/auth', label: '网络验证', mobileLabel: '卡密', icon: 'Key', permissionAny: ['authCreate', 'authDelete', 'authExport', 'authUnbind'] },
+  { path: '/customer', label: '用户管理', mobileLabel: '用户', icon: 'User', permission: 'userView' },
   { path: '/cloudVariables', label: '云变量', icon: 'Files', permission: 'cloudVarView' },
   { path: '/blackWhiteList', label: '黑白名单', icon: 'List', permission: 'blackWhiteView' },
   { path: '/evenList', label: '事件日志', icon: 'Tickets', permission: 'eventView' },
-  { path: '/proxy', label: '账号管理', icon: 'Connection', permission: 'accountManage' },
+  { path: '/proxy', label: '账号管理', mobileLabel: '账号', icon: 'Connection', permission: 'accountManage' },
   { path: '/client-api', label: '接入测试', icon: 'Cpu' },
   { path: '/user', label: '个人中心', icon: 'Setting' }
 ]
+const mobilePrimaryPaths = ['/dashboard', '/softWare', '/auth', '/proxy']
 
 const navItems = computed(() => allNavItems.filter((item) => {
   if (item.permission) return hasPermission(item.permission)
   if (item.permissionAny) return hasAnyPermission(item.permissionAny)
   return true
 }))
+
+const primaryMobileNavItems = computed(() => {
+  const picked = mobilePrimaryPaths
+    .map((path) => navItems.value.find((item) => item.path === path))
+    .filter(Boolean)
+  navItems.value.forEach((item) => {
+    if (picked.length < 4 && !picked.some((entry) => entry.path === item.path)) picked.push(item)
+  })
+  return picked.slice(0, 4)
+})
+
+const overflowMobileNavItems = computed(() => navItems.value.filter((item) => !primaryMobileNavItems.value.some((entry) => entry.path === item.path)))
+const isMoreActive = computed(() => overflowMobileNavItems.value.some((item) => item.path === route.path))
 
 const pageTitle = computed(() => {
   const item = allNavItems.find((entry) => entry.path === route.path)

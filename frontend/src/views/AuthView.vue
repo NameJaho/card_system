@@ -6,15 +6,15 @@
           <el-input
             v-model="query.keyword"
             :prefix-icon="Search"
-            placeholder="搜索卡密 / 实例 ID / 设备码 / 备注"
+            placeholder="搜索卡密 / 实例 / 设备 / 备注"
             clearable
             @keyup.enter="search"
           />
         </div>
-        <el-select v-model="query.softwareId" placeholder="按实例筛选" clearable>
+        <el-select v-model="query.softwareId" placeholder="实例" clearable>
           <el-option v-for="item in software" :key="item.softwareId" :label="item.name" :value="item.softwareId" />
         </el-select>
-        <el-input v-model="query.authId" placeholder="卡密精确/片段" clearable />
+        <el-input v-model="query.authId" placeholder="卡密片段" clearable />
         <el-input v-model="query.macid" placeholder="设备码" clearable />
         <el-select v-model="query.status" placeholder="状态" clearable>
           <el-option label="未激活" value="unused" />
@@ -28,7 +28,7 @@
 
       <div class="auth-actions">
         <el-button v-if="canCreateAuth" type="success" :icon="Plus" @click="openCreate">新增卡密</el-button>
-        <el-button v-if="canExportAuth" :icon="Download" @click="exportRows">导出当前条件</el-button>
+        <el-button v-if="canExportAuth" :icon="Download" @click="exportRows">导出</el-button>
         <el-button v-if="canDeleteAuth" type="danger" :icon="Delete" :disabled="selected.length === 0" @click="batchDelete">批量删除</el-button>
       </div>
 
