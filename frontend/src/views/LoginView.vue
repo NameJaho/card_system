@@ -49,11 +49,24 @@
           </el-button>
         </el-form>
         <div class="login-links">
+          <el-button link :loading="smartLoading" @click="smartLoginFromClipboard">一键识别登录</el-button>
           <el-button link @click="forgotVisible = true">找回密码</el-button>
         </div>
       </div>
     </section>
-    <el-dialog v-model="forgotVisible" title="找回密码" width="420px">
+    <el-dialog v-model="pasteVisible" title="识别分享文本" width="min(460px, calc(100vw - 24px))">
+      <el-input
+        v-model="pasteText"
+        type="textarea"
+        :rows="7"
+        placeholder="粘贴管理员分享的整段登录信息，系统会自动识别账号和密码"
+      />
+      <template #footer>
+        <el-button @click="pasteVisible = false">取消</el-button>
+        <el-button type="primary" :loading="smartLoading" @click="smartLoginFromText(pasteText)">识别并登录</el-button>
+      </template>
+    </el-dialog>
+    <el-dialog v-model="forgotVisible" title="找回密码" width="min(420px, calc(100vw - 24px))">
       <el-input v-model="forgotEmail" placeholder="请输入注册邮箱" />
       <template #footer>
         <el-button @click="forgotVisible = false">取消</el-button>
@@ -72,8 +85,11 @@ import { api, clearSession, setSession } from '../services/api'
 
 const router = useRouter()
 const loading = ref(false)
+const smartLoading = ref(false)
 const forgotVisible = ref(false)
 const forgotEmail = ref('')
+const pasteVisible = ref(false)
+const pasteText = ref('')
 const form = reactive({ user: '', password: '' })
 
 async function submit() {
@@ -100,6 +116,60 @@ async function sendForgot() {
   if (res.success) {
     ElMessage.success(res.message)
     forgotVisible.value = false
+  }
+}
+
+function parseSharedCredentials(text) {
+  const raw = String(text || '').trim()
+  if (!raw) return null
+  const userMatch = raw.match(/(?:账号|用户名|账户|user|username|account)\s*[：:=]\s*([^\s,，;；]+)/i)
+  const passwordMatch = raw.match(/(?:密码|password|pass|pwd)\s*[：:=]\s*([^\s,，;；]+)/i)
+  if (userMatch && passwordMatch) {
+    return { user: userMatch[1].trim(), password: passwordMatch[1].trim() }
+  }
+  const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+  const compact = lines.filter((line) => !/(登录地址|角色|实例范围|后台账号登录信息|尽快修改密码)/.test(line))
+  if (compact.length >= 2) return { user: compact[0], password: compact[1] }
+  return null
+}
+
+async function smartLogin(text) {
+  const credentials = parseSharedCredentials(text)
+  if (!credentials) {
+    ElMessage.warning('未识别到账号和密码，请粘贴完整分享文本')
+    pasteVisible.value = true
+    return
+  }
+  form.user = credentials.user
+  form.password = credentials.password
+  pasteVisible.value = false
+  await submit()
+}
+
+async function smartLoginFromText(text) {
+  smartLoading.value = true
+  try {
+    await smartLogin(text)
+  } finally {
+    smartLoading.value = false
+  }
+}
+
+async function smartLoginFromClipboard() {
+  smartLoading.value = true
+  try {
+    if (!navigator.clipboard?.readText) {
+      pasteVisible.value = true
+      return
+    }
+    const text = await navigator.clipboard.readText()
+    pasteText.value = text
+    await smartLogin(text)
+  } catch {
+    pasteVisible.value = true
+    ElMessage.warning('浏览器未允许读取剪贴板，请手动粘贴分享文本')
+  } finally {
+    smartLoading.value = false
   }
 }
 
