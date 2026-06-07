@@ -134,7 +134,7 @@
               <h3>账号资料</h3>
               <div class="panel-header-actions">
                 <span>{{ dialog.isCreate ? '密码为必填项' : '密码留空则保持不变' }}</span>
-                <el-button size="small" :icon="Refresh" @click="quickFillAccount">{{ dialog.isCreate ? '一键生成' : '生成新密码' }}</el-button>
+                <el-button size="small" :icon="Refresh" @click="quickFillAccount()">{{ dialog.isCreate ? '一键生成' : '生成新密码' }}</el-button>
               </div>
             </div>
             <div class="form-grid">
@@ -221,6 +221,8 @@
           <div class="summary-row"><span>权限数</span><em>{{ selectedRolePermissions.length }} 项</em></div>
           <div class="summary-row"><span>实例范围</span><em>{{ scopeSummary }}</em></div>
           <div class="summary-row"><span>密码</span><em>{{ passwordSummary }}</em></div>
+          <div class="summary-row summary-url-row"><span>登录地址</span><em :title="shareLoginUrl">{{ shareLoginUrl }}</em></div>
+          <el-button v-if="dialog.isCreate" class="summary-share-button" :icon="CopyDocument" :loading="sharing" @click="saveAndShare">一键分享</el-button>
           <div class="summary-pulse"><i></i><span>等待保存</span></div>
         </aside>
       </div>
@@ -236,7 +238,7 @@
 <script setup>
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, EditPen, Finished, Plus, Refresh } from '@element-plus/icons-vue'
+import { CopyDocument, Delete, EditPen, Finished, Plus, Refresh } from '@element-plus/icons-vue'
 import { api, session } from '../services/api'
 
 const permissionMap = {
@@ -276,6 +278,7 @@ const rows = ref([])
 const software = ref([])
 const loading = ref(false)
 const saving = ref(false)
+const sharing = ref(false)
 const onlineCount = ref(0)
 const dialog = reactive({ visible: false, isCreate: true })
 const form = reactive({ user: '', password: '', nick: '', email: '', role: 'user', softwareIds: [] })
@@ -291,11 +294,22 @@ const roleCount = computed(() => rows.value.reduce((acc, row) => {
   return acc
 }, { developer: 0, admin: 0, user: 0 }))
 const roleHelpText = computed(() => (session.role === 'developer' ? '超级管理员可以创建任意角色。' : '管理员只能创建普通用户。'))
+const defaultCreateRole = computed(() => (availableRoleOptions.value.some((item) => item.value === 'user') ? 'user' : availableRoleOptions.value[0]?.value || 'user'))
 const scopeSummary = computed(() => {
   if (!isUserRole.value) return '全部实例'
   if (selectedSoftwareItems.value.length) return `${selectedSoftwareItems.value.length} 个指定实例`
   return '未选择实例'
 })
+const shareLoginUrl = computed(() => adminLoginUrl())
+const shareText = computed(() => [
+  '后台账号登录信息',
+  `登录地址：${shareLoginUrl.value}`,
+  `账号：${form.user || '未填写'}`,
+  `密码：${form.password || '未设置'}`,
+  `角色：${selectedRole.value?.label || '未选择'}`,
+  `实例范围：${scopeSummary.value}`,
+  '登录后请尽快修改密码。'
+].join('\n'))
 const passwordSummary = computed(() => {
   if (dialog.isCreate) return form.password ? '已设置' : '未设置'
   return form.password ? '将更新' : '保持原密码'
@@ -331,7 +345,7 @@ function resetForm() {
     password: '',
     nick: '',
     email: '',
-    role: availableRoleOptions.value[0]?.value || 'user',
+    role: defaultCreateRole.value,
     softwareIds: []
   })
 }
@@ -340,13 +354,18 @@ function randomSuffix() {
   return Math.random().toString(36).slice(2, 8)
 }
 
+function generateUsername(role = form.role) {
+  const prefixMap = { developer: 'dev', admin: 'admin', user: 'user' }
+  return `${prefixMap[role] || 'user'}_${Date.now().toString(36).slice(-4)}${randomSuffix()}`
+}
+
 function generatePassword() {
   return `Kd${randomSuffix()}${Math.floor(1000 + Math.random() * 9000)}`
 }
 
-function quickFillAccount() {
-  if (dialog.isCreate && !form.user.trim()) form.user = `user_${randomSuffix()}`
-  if (dialog.isCreate && !form.nick.trim()) form.nick = roleLabel(form.role)
+function quickFillAccount(forceUsername = dialog.isCreate) {
+  if (dialog.isCreate && (forceUsername || !form.user.trim())) form.user = generateUsername(form.role)
+  if (dialog.isCreate && (forceUsername || !form.nick.trim())) form.nick = roleLabel(form.role)
   form.password = generatePassword()
   if (isUserRole.value && form.softwareIds.length === 0 && software.value[0]) {
     form.softwareIds = [software.value[0].softwareId]
@@ -356,6 +375,7 @@ function quickFillAccount() {
 function openCreate() {
   dialog.isCreate = true
   resetForm()
+  quickFillAccount(true)
   dialog.visible = true
 }
 
@@ -403,22 +423,73 @@ async function save() {
   if (!validateForm()) return
   saving.value = true
   try {
-    const payload = {
-      user: form.user.trim(),
-      password: form.password,
-      nick: form.nick.trim(),
-      email: form.email.trim(),
-      role: form.role,
-      softwareIds: isUserRole.value ? form.softwareIds : ['*']
-    }
-    const res = dialog.isCreate ? await api.createSubUser(payload) : await api.updateSubUser(payload)
-    if (res.success) {
+    if (await persistAccount()) {
       ElMessage.success('账号已保存')
       dialog.visible = false
-      await load()
     }
   } finally {
     saving.value = false
+  }
+}
+
+function accountPayload() {
+  return {
+    user: form.user.trim(),
+    password: form.password,
+    nick: form.nick.trim(),
+    email: form.email.trim(),
+    role: form.role,
+    softwareIds: isUserRole.value ? form.softwareIds : ['*']
+  }
+}
+
+async function persistAccount() {
+  const res = dialog.isCreate ? await api.createSubUser(accountPayload()) : await api.updateSubUser(accountPayload())
+  if (res.success) {
+    await load()
+    return true
+  }
+  return false
+}
+
+function adminLoginUrl() {
+  const basePath = window.location.pathname.endsWith('/') ? window.location.pathname : `${window.location.pathname}/`
+  return `${window.location.origin}${basePath}#/login`
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text)
+  } catch {
+    const textarea = document.createElement('textarea')
+    textarea.value = text
+    textarea.setAttribute('readonly', '')
+    textarea.style.position = 'fixed'
+    textarea.style.left = '-9999px'
+    document.body.appendChild(textarea)
+    textarea.select()
+    document.execCommand('copy')
+    document.body.removeChild(textarea)
+  }
+}
+
+async function saveAndShare() {
+  if (!dialog.isCreate) return
+  if (!form.password.trim()) {
+    ElMessage.warning(dialog.isCreate ? '请先生成密码' : '请先生成新密码')
+    return
+  }
+  if (!validateForm()) return
+  const text = shareText.value
+  sharing.value = true
+  try {
+    if (await persistAccount()) {
+      await copyText(text)
+      ElMessage.success('账号已保存，分享信息已复制')
+      dialog.visible = false
+    }
+  } finally {
+    sharing.value = false
   }
 }
 

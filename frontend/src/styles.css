@@ -1196,6 +1196,29 @@ select {
   font-size: 12px;
 }
 
+.summary-url-row em {
+  min-width: 0;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.summary-share-button.el-button {
+  width: 100%;
+  margin-top: 14px;
+  color: #e8fbff;
+  border-color: rgb(112 240 255 / 26%);
+  background: rgb(112 240 255 / 10%);
+}
+
+.summary-share-button.el-button:hover,
+.summary-share-button.el-button:focus {
+  color: #ffffff;
+  border-color: rgb(112 240 255 / 48%);
+  background: rgb(112 240 255 / 16%);
+}
+
 .summary-pulse {
   position: absolute;
   left: 18px;
@@ -1865,6 +1888,11 @@ select {
 .proxy-summary,
 .software-summary {
   min-height: 100%;
+}
+
+.proxy-summary .summary-pulse {
+  position: static;
+  margin-top: 12px;
 }
 
 .proxy-summary .summary-row em,
