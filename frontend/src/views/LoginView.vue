@@ -74,7 +74,7 @@ const router = useRouter()
 const loading = ref(false)
 const forgotVisible = ref(false)
 const forgotEmail = ref('')
-const form = reactive({ user: 'admin', password: 'admin123456' })
+const form = reactive({ user: '', password: '' })
 
 async function submit() {
   loading.value = true
