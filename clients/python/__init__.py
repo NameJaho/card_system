@@ -1,3 +1,3 @@
-from .keydesk_client import KeyDeskApp, KeyDeskClient, KeyDeskConfig, KeyDeskConfigError, KeyDeskError
+from .keydesk_client import KeyDesk, KeyDeskApp, KeyDeskClient, KeyDeskConfig, KeyDeskConfigError, KeyDeskError, KeyDeskNetworkError, LicenseError
 
-__all__ = ["KeyDeskApp", "KeyDeskClient", "KeyDeskConfig", "KeyDeskConfigError", "KeyDeskError"]
+__all__ = ["KeyDesk", "KeyDeskApp", "KeyDeskClient", "KeyDeskConfig", "KeyDeskConfigError", "KeyDeskError", "KeyDeskNetworkError", "LicenseError"]

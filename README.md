@@ -4,16 +4,16 @@
 
 ## 功能清单
 
-- 后台账号：登录、超级管理员创建账号、找回密码、免密码登录标记清除、个人资料修改、OpenId/AccountToken 重新生成。
+- 后台账号：登录、一次性令牌找回密码、会话吊销、超级管理员创建账号和个人资料修改。
 - 数据面板：活跃实例、日访问、日激活、月访问、访问曲线、实例访问排行。
-- 实例管理：创建、搜索、编辑、删除实例，维护版本、最低版本、强制更新、下载地址、MD5、公告、备注。
+- 实例管理：创建、搜索、编辑、删除实例，维护版本、最低版本、下载地址、SHA-256、公告、备注。
 - 网络验证：创建卡密、搜索卡密、导出 CSV、批量删除、单个删除、修改备注、解绑/换绑、绑定次数，并标识卡密创建者姓名和角色。
 - 用户管理：软件侧注册用户查询、关联实例信息、删除用户。
 - 云变量：全局变量和实例变量，支持启用/停用，保存前校验重复。
 - 黑白名单：按实例维护白名单/黑名单，软件侧验证时生效。
 - 事件日志：记录后台登录、软件侧检查更新、激活、验证、解绑、用户注册登录、心跳等事件。
 - 子账户：创建/编辑/删除子账户，分配实例范围和细粒度权限。
-- 软件侧 API：检查更新、激活卡密、验证卡密、解绑、读取云变量、用户注册/登录/心跳/退出。
+- 软件侧 API：推荐单一幂等 `/api/client/v1/license/validate`；旧检查、激活、验证和解绑接口仅作迁移兼容。
 
 ## 技术栈
 
@@ -44,7 +44,7 @@ npm install
 npm run dev
 ```
 
-访问 `http://localhost:5173`。默认账号：
+访问 `http://localhost:5173`。以下默认账号只适用于本地开发：
 
 ```text
 账号：admin
@@ -57,7 +57,7 @@ npm run dev
 
 ```bash
 cp .env.example .env
-# 编辑 .env，至少修改 CARD_SECRET_KEY、MYSQL_ROOT_PASSWORD、MYSQL_PASSWORD 和默认管理员密码
+# 编辑 .env，填写 HTTPS 公网地址、CORS，并修改全部 secret 和默认管理员密码
 docker compose up -d --build
 ```
 
@@ -112,6 +112,11 @@ OpenClaw 安装流程见 [docs/openclaw-deploy.md](docs/openclaw-deploy.md)。
 ## 环境变量
 
 - `CARD_HTTP_PORT`：前端 Nginx 暴露端口。
+- `CARD_ENV`：Docker 默认 `production`，会启用不安全默认值启动门禁。
+- `CARD_PUBLIC_BASE_URL`：后台复制最小客户端配置时使用的 HTTPS 公网地址。
+- `CARD_CORS_ORIGINS`：允许访问后台 API 的前端来源，逗号分隔。
+- `CARD_APP_VERSION`：显示在 `/health` 中的发布版本。
+- `CARD_GIT_SHA`：显示在 `/health` 中的发布提交。
 - `CARD_SECRET_KEY`：JWT 签名密钥，生产必须修改。
 - `CARD_ALLOW_DEV_RESET_LINK`：是否允许找回密码接口直接返回重置 token，生产默认关闭。
 - `CARD_DEFAULT_ADMIN_USER`：初始化管理员账号。
@@ -125,14 +130,16 @@ OpenClaw 安装流程见 [docs/openclaw-deploy.md](docs/openclaw-deploy.md)。
 - `MYSQL_PASSWORD`：业务数据库密码。
 - `MYSQL_DATA_DIR`：MySQL 宿主机持久化目录，默认 `./runtime/mysql`。
 
+数据库升级和安全发布步骤见 [docs/security-migration.md](docs/security-migration.md)，完整线上更新操作见 [docs/production-update.md](docs/production-update.md)。客户端新协议见 [docs/client-integration.md](docs/client-integration.md)。Docker 后端启动时会先执行 `alembic upgrade head`，迁移成功后才启动 API。
+
 首次启动时如果 MySQL 为空，会自动建表并创建默认超级管理员和演示实例/卡密。
 
 ## 后台接口
 
-后台接口统一前缀为 `/api/adm`，请求头使用：
+后台接口统一前缀为 `/api/adm`，推荐使用标准 Bearer 请求头（旧 `token` 请求头暂时兼容）：
 
 ```text
-token: <登录返回的 token>
+Authorization: Bearer <登录返回的 token>
 ```
 
 统一响应格式：
@@ -168,90 +175,22 @@ token: <登录返回的 token>
 
 ## 软件侧 API
 
-软件客户端接口统一前缀为 `/api/client`。
+新客户端配置只包含 `baseUrl`、`softwareId` 和 `version`，统一调用：
 
-完整接入流程和可运行示例见 [docs/client-integration.md](docs/client-integration.md)。推荐客户端只引入 SDK，并通过配置文件维护项目名、服务地址、软件 ID、实例密钥和版本号。
-
-配置模板：
-
-```text
-clients/python/keydesk-client.example.json
+```http
+POST /api/client/v1/license/validate
 ```
 
-最小 Python 示例：
+Python 入口：
 
 ```python
-from clients.python import KeyDeskApp, KeyDeskError
+from clients.python import KeyDesk
 
-app = KeyDeskApp.from_file("keydesk-client.json")
-
-try:
-    app.check_update()
-    card = app.require_license()
-    variables = app.cloud_variables()
-except KeyDeskError as exc:
-    print(f"授权失败: {exc}")
+license = KeyDesk.from_file("keydesk.json")
+license.require_license(prompt=lambda: input("请输入卡密：").strip())
 ```
 
-检查更新：
-
-```http
-POST /api/client/software/checkUpdate
-```
-
-```json
-{
-  "softwareId": "SWxxxx",
-  "instanceKey": "IKxxxx",
-  "version": "1.0.0",
-  "macid": "DEVICE-001"
-}
-```
-
-激活卡密：
-
-```http
-POST /api/client/auth/activate
-```
-
-```json
-{
-  "softwareId": "SWxxxx",
-  "instanceKey": "IKxxxx",
-  "authId": "KMxxxx",
-  "macid": "DEVICE-001"
-}
-```
-
-验证卡密：
-
-```http
-POST /api/client/auth/verify
-```
-
-```json
-{
-  "softwareId": "SWxxxx",
-  "instanceKey": "IKxxxx",
-  "authId": "KMxxxx",
-  "macid": "DEVICE-001"
-}
-```
-
-读取云变量：
-
-```http
-POST /api/client/cloudVariables/list
-```
-
-软件侧用户：
-
-```http
-POST /api/client/user/register
-POST /api/client/user/login
-POST /api/client/user/heartbeat
-POST /api/client/user/logout
-```
+SDK 自动创建随机 installation ID，并按稳定错误码区分过期、撤销、设备冲突和网络异常。完整契约及旧协议迁移规则见 [docs/client-integration.md](docs/client-integration.md)。
 
 ## 权限说明
 

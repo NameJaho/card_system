@@ -3,6 +3,9 @@ from __future__ import annotations
 import math
 import secrets
 import string
+import threading
+import time
+from collections import defaultdict, deque
 from datetime import datetime
 from typing import Any
 
@@ -13,8 +16,45 @@ def ok(data: Any = None, message: str = "请求成功", code: int = 200) -> dict
     return {"code": code, "success": True, "message": message, "data": data}
 
 
-def fail(message: str, code: int = 400, status_code: int = 200) -> JSONResponse:
-    return JSONResponse(status_code=status_code, content={"code": code, "success": False, "message": message, "data": None})
+def fail(
+    message: str,
+    code: int = 400,
+    status_code: int = 200,
+    error_code: str | None = None,
+    retryable: bool = False,
+) -> JSONResponse:
+    content: dict[str, Any] = {"code": code, "success": False, "message": message, "data": None}
+    if error_code:
+        content["error"] = {"code": error_code, "message": message, "retryable": retryable}
+    return JSONResponse(status_code=status_code, content=content)
+
+
+def api_error(code: str, message: str, status_code: int, retryable: bool = False) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={"success": False, "error": {"code": code, "message": message, "retryable": retryable}},
+    )
+
+
+class SlidingWindowRateLimiter:
+    def __init__(self) -> None:
+        self._events: dict[str, deque[float]] = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def allow(self, key: str, limit: int, window_seconds: int) -> bool:
+        now = time.monotonic()
+        cutoff = now - window_seconds
+        with self._lock:
+            events = self._events[key]
+            while events and events[0] <= cutoff:
+                events.popleft()
+            if len(events) >= limit:
+                return False
+            events.append(now)
+            return True
+
+
+rate_limiter = SlidingWindowRateLimiter()
 
 
 def page_payload(page: dict[str, Any] | int | None, default_limit: int = 10) -> tuple[int, int]:

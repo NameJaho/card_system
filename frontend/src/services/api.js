@@ -66,7 +66,7 @@ export async function request(path, body = {}, options = {}) {
     method: options.method || 'POST',
     headers: {
       'Content-Type': 'application/json;charset=UTF-8',
-      token: getToken(),
+      Authorization: `Bearer ${getToken()}`,
       ...(options.headers || {})
     },
     body: options.method === 'GET' ? undefined : JSON.stringify(body)
@@ -78,9 +78,9 @@ export async function request(path, body = {}, options = {}) {
     throw new Error(data.detail || data.message || 'token 失效了')
   }
   if (!response.ok) {
-    const message = data.detail || data.message || '请求失败'
+    const message = data.error?.message || data.detail || data.message || '请求失败'
     ElMessage.warning(message)
-    return { success: false, message, data: data.data }
+    return { ...data, success: false, message, data: data.data }
   }
   if (data && data.success === false) {
     ElMessage.warning(data.message || '请求失败')
@@ -93,7 +93,7 @@ export async function downloadCsv(path, body = {}, filename = 'export.csv') {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json;charset=UTF-8',
-      token: getToken()
+      Authorization: `Bearer ${getToken()}`
     },
     body: JSON.stringify(body)
   })
@@ -106,10 +106,33 @@ export async function downloadCsv(path, body = {}, filename = 'export.csv') {
   URL.revokeObjectURL(url)
 }
 
+export async function downloadFile(path, body = {}, filename = 'download.bin') {
+  const response = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json;charset=UTF-8', Authorization: `Bearer ${getToken()}` },
+    body: JSON.stringify(body)
+  })
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}))
+    const message = data.error?.message || data.detail || data.message || '下载失败'
+    ElMessage.warning(message)
+    return false
+  }
+  const blob = await response.blob()
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  link.click()
+  URL.revokeObjectURL(url)
+  return true
+}
+
 export const api = {
   login: (body) => request('/api/adm/login', body),
   forgotPassword: (body) => request('/api/adm/forgotPassword', body),
   me: () => request('/api/adm/user', {}),
+  userConfig: () => request('/api/adm/user-config', {}),
   updateUser: (body) => request('/api/adm/updateUserInfo', body),
   clearFinger: () => request('/api/adm/clearFingerId', {}),
   dataCount: () => request('/api/adm/dataCount', {}),
@@ -117,11 +140,13 @@ export const api = {
   softwareSelect: () => request('/api/adm/softwareSelect', {}),
   createSoftware: (body) => request('/api/adm/createSoftware', body),
   updateSoftware: (body) => request('/api/adm/updateSoftware', body),
+  rotateInstanceKey: (body) => request('/api/adm/rotateInstanceKey', body),
   deleteSoftware: (body) => request('/api/adm/delSoftware', body),
   authList: (body) => request('/api/adm/authList', body),
   createAuth: (body) => request('/api/adm/createAuth', body),
   editAuth: (body) => request('/api/adm/editAuth', body),
   unbindAuth: (body) => request('/api/adm/commitUnBind', body),
+  revokeAuth: (body) => request('/api/adm/revokeAuth', body),
   updateAuthRemark: (body) => request('/api/adm/updateAuthRemark', body),
   deleteAuth: (body) => request('/api/adm/delAuth', body),
   batchDeleteAuth: (body) => request('/api/adm/batchDelAuth', body),
@@ -141,6 +166,7 @@ export const api = {
   clientUpdate: (body) => request('/api/client/software/checkUpdate', body),
   clientActivate: (body) => request('/api/client/auth/activate', body),
   clientVerify: (body) => request('/api/client/auth/verify', body),
+  clientValidate: (body) => request('/api/client/v1/license/validate', body),
   clientUnbind: (body) => request('/api/client/auth/unbind', body),
   clientVars: (body) => request('/api/client/cloudVariables/list', body),
   clientRegister: (body) => request('/api/client/user/register', body),

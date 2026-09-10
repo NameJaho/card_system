@@ -52,7 +52,7 @@
           <template #default="{ row }">
             <el-button v-if="canEdit" size="small" :icon="EditPen" @click="edit(row)">编辑</el-button>
             <el-button size="small" :icon="CopyDocument" @click="copy(row.softwareId)">复制 ID</el-button>
-            <el-button size="small" :icon="DocumentCopy" @click="copyClientConfig(row)">复制配置</el-button>
+            <el-button size="small" :icon="DocumentCopy" @click="openIntegration(row)">接入客户端</el-button>
             <el-button v-if="canDelete" size="small" type="danger" :icon="Delete" @click="remove(row)">删除</el-button>
           </template>
         </el-table-column>
@@ -84,7 +84,7 @@
             <el-button v-if="canEdit" size="small" :icon="EditPen" @click="edit(row)">编辑</el-button>
             <el-button size="small" :icon="CopyDocument" @click="copy(row.softwareId)">复制 ID</el-button>
             <el-button size="small" :icon="CopyDocument" @click="copy(row.instanceKey)">复制密钥</el-button>
-            <el-button size="small" :icon="DocumentCopy" @click="copyClientConfig(row)">复制配置</el-button>
+            <el-button size="small" :icon="DocumentCopy" @click="openIntegration(row)">接入客户端</el-button>
             <el-button v-if="canDelete" size="small" type="danger" :icon="Delete" @click="remove(row)">删除</el-button>
           </div>
         </article>
@@ -155,8 +155,8 @@
               <el-input v-model.trim="form.url" placeholder="https://example.com/app.zip" />
             </el-form-item>
             <div class="form-grid">
-              <el-form-item label="文件 MD5">
-                <el-input v-model.trim="form.md5" placeholder="用于客户端校验下载包" />
+              <el-form-item label="文件 SHA-256">
+                <el-input v-model.trim="form.sha256" placeholder="64 位 SHA-256 校验值" />
               </el-form-item>
               <el-form-item label="备注">
                 <el-input v-model.trim="form.remark" placeholder="仅后台可见" />
@@ -178,17 +178,34 @@
           <div class="summary-row"><span>更新策略</span><em>{{ form.force ? '强制更新' : '提示更新' }}</em></div>
           <div class="endpoint-list">
             <span>客户端端点</span>
-            <code>/api/client/software/checkUpdate</code>
-            <code>/api/client/auth/verify</code>
+            <code>/api/client/v1/license/validate</code>
           </div>
           <div class="summary-pulse"><i></i><span>配置待保存</span></div>
-          <el-button v-if="!dialog.isCreate" class="w-full" :icon="DocumentCopy" @click="copyClientConfig(form)">复制客户端配置</el-button>
+          <el-button v-if="!dialog.isCreate" class="w-full" :icon="DocumentCopy" @click="openIntegration(form)">接入客户端</el-button>
         </aside>
       </div>
 
       <template #footer>
         <el-button @click="dialog.visible = false">取消</el-button>
         <el-button type="primary" :icon="Finished" :loading="saving" @click="save">保存实例</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="integration.visible" title="接入客户端" width="640px" append-to-body>
+      <el-descriptions :column="1" border>
+        <el-descriptions-item label="公共服务地址">{{ publicBaseUrl }}</el-descriptions-item>
+        <el-descriptions-item label="软件 ID">{{ integration.row?.softwareId }}</el-descriptions-item>
+        <el-descriptions-item label="协议版本">v1</el-descriptions-item>
+        <el-descriptions-item label="Python SDK">{{ sdkVersion }}</el-descriptions-item>
+        <el-descriptions-item label="服务版本">{{ appVersion }} / {{ gitSha }} / schema {{ schemaVersion }}</el-descriptions-item>
+        <el-descriptions-item label="授权接口">/api/client/v1/license/validate</el-descriptions-item>
+      </el-descriptions>
+      <p class="muted">配置只包含服务地址、软件 ID 和版本。卡密由最终用户输入，installation ID 由 SDK 自动生成。</p>
+      <pre class="json-box">{{ JSON.stringify(clientConfig(integration.row || {}), null, 2) }}</pre>
+      <template #footer>
+        <el-button v-if="canEdit" type="danger" plain @click="rotateLegacyKey">轮换旧协议密钥</el-button>
+        <el-button @click="copyClientConfig(integration.row || {})">复制最小配置</el-button>
+        <el-button type="primary" @click="downloadPackage">下载 Python 接入包</el-button>
       </template>
     </el-dialog>
   </div>
@@ -198,7 +215,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { CopyDocument, Delete, DocumentCopy, EditPen, Finished, Plus, Refresh, Search } from '@element-plus/icons-vue'
-import { api, hasPermission } from '../services/api'
+import { api, downloadFile, hasPermission } from '../services/api'
 
 const loading = ref(false)
 const saving = ref(false)
@@ -206,7 +223,13 @@ const rows = ref([])
 const query = reactive({ softwareName: '', softwareId: '' })
 const page = reactive({ pageNum: 1, limit: 10, count: 0 })
 const dialog = reactive({ visible: false, isCreate: true })
-const form = reactive({ softwareId: '', instanceKey: '', name: '', version: '', lowVersion: '', md5: '', url: '', notice: '', remark: '', force: false })
+const integration = reactive({ visible: false, row: null })
+const form = reactive({ softwareId: '', instanceKey: '', name: '', version: '', lowVersion: '', sha256: '', url: '', notice: '', remark: '', force: false })
+const publicBaseUrl = ref('')
+const sdkVersion = ref('1.0.0')
+const appVersion = ref('dev')
+const gitSha = ref('unknown')
+const schemaVersion = ref('unknown')
 const versionPresets = ['1.0.0', '1.1.0', '2.0.0', '3.0.0']
 const canCreate = computed(() => hasPermission('softCreate'))
 const canEdit = computed(() => hasPermission('softEdit'))
@@ -225,6 +248,17 @@ async function load() {
   }
 }
 
+async function loadPublicConfig() {
+  const res = await api.userConfig()
+  if (res.success) {
+    publicBaseUrl.value = res.data.publicBaseUrl || ''
+    sdkVersion.value = res.data.sdkVersion || '1.0.0'
+    appVersion.value = res.data.appVersion || 'dev'
+    gitSha.value = res.data.gitSha || 'unknown'
+    schemaVersion.value = res.data.schemaVersion || 'unknown'
+  }
+}
+
 function search() {
   page.pageNum = 1
   load()
@@ -238,7 +272,7 @@ function reset() {
 
 function openCreate() {
   dialog.isCreate = true
-  Object.assign(form, { softwareId: '', instanceKey: '', name: '', version: '1.0.0', lowVersion: '', md5: '', url: '', notice: '', remark: '', force: false })
+  Object.assign(form, { softwareId: '', instanceKey: '', name: '', version: '1.0.0', lowVersion: '', sha256: '', url: '', notice: '', remark: '', force: false })
   dialog.visible = true
 }
 
@@ -250,7 +284,7 @@ function edit(row) {
     name: row.name || '',
     version: row.version || '',
     lowVersion: row.lowVersion || '',
-    md5: row.md5 || '',
+    sha256: row.sha256 || '',
     url: row.url || '',
     notice: row.notice || '',
     remark: row.remark || '',
@@ -292,7 +326,7 @@ async function save() {
       name: form.name.trim(),
       version: form.version.trim(),
       lowVersion: form.lowVersion.trim(),
-      md5: form.md5.trim(),
+      sha256: form.sha256.trim(),
       url: form.url.trim(),
       notice: form.notice,
       remark: form.remark.trim(),
@@ -303,6 +337,7 @@ async function save() {
       ElMessage.success(dialog.isCreate ? '实例已创建' : '实例已更新')
       dialog.visible = false
       await load()
+      if (dialog.isCreate) openIntegration(res.data)
     }
   } finally {
     saving.value = false
@@ -329,18 +364,13 @@ function maskSecret(value) {
 
 function clientConfig(row) {
   return {
-    projectName: row.name || 'KeyDesk App',
-    baseUrl: window.location.origin,
+    baseUrl: publicBaseUrl.value,
     softwareId: row.softwareId || '',
-    instanceKey: row.instanceKey || '',
-    version: row.version || '1.0.0',
-    authId: '',
-    macid: '',
-    licenseFile: '.keydesk-license.json',
-    deviceFile: '.keydesk-device',
-    timeout: 10,
-    heartbeatInterval: 60,
-    autoActivate: true
+    version: row.version || '1.0.0'
+  }
+  if (form.sha256 && !/^[0-9a-f]{64}$/i.test(form.sha256)) {
+    ElMessage.warning('SHA-256 必须是 64 位十六进制字符串')
+    return false
   }
 }
 
@@ -348,5 +378,35 @@ function copyClientConfig(row) {
   copy(JSON.stringify(clientConfig(row), null, 2))
 }
 
-onMounted(load)
+function openIntegration(row) {
+  integration.row = { ...row }
+  integration.visible = true
+}
+
+async function downloadPackage() {
+  const row = integration.row || {}
+  if (!row.softwareId) return
+  await downloadFile(
+    '/api/adm/clientPackage',
+    { softwareId: row.softwareId },
+    `keydesk-${row.softwareId}-python-v1.zip`
+  )
+}
+
+async function rotateLegacyKey() {
+  const row = integration.row || {}
+  if (!row.softwareId) return
+  await ElMessageBox.confirm('轮换后，仍使用旧协议的客户端必须更新 instanceKey。确定继续？', '轮换旧协议密钥', { type: 'warning' })
+  const res = await api.rotateInstanceKey({ softwareId: row.softwareId })
+  if (res.success) {
+    integration.row = { ...res.data }
+    ElMessage.success('旧协议实例密钥已轮换')
+    load()
+  }
+}
+
+onMounted(() => {
+  load()
+  loadPublicConfig()
+})
 </script>

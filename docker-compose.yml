@@ -27,12 +27,23 @@ services:
       args:
         PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
     environment:
+      CARD_ENV: ${CARD_ENV:-production}
       CARD_DATABASE_URL: mysql+pymysql://${MYSQL_USER:-card_user}:${MYSQL_PASSWORD:-card_password}@mysql:3306/${MYSQL_DATABASE:-card_system}?charset=utf8mb4
       CARD_SECRET_KEY: ${CARD_SECRET_KEY:-change-this-secret}
       CARD_DEFAULT_ADMIN_USER: ${CARD_DEFAULT_ADMIN_USER:-admin}
       CARD_DEFAULT_ADMIN_PASSWORD: ${CARD_DEFAULT_ADMIN_PASSWORD:-admin123456}
       CARD_DEFAULT_ADMIN_EMAIL: ${CARD_DEFAULT_ADMIN_EMAIL:-admin@example.com}
       CARD_ALLOW_DEV_RESET_LINK: ${CARD_ALLOW_DEV_RESET_LINK:-false}
+      CARD_SMTP_HOST: ${CARD_SMTP_HOST:-}
+      CARD_SMTP_PORT: ${CARD_SMTP_PORT:-587}
+      CARD_SMTP_USER: ${CARD_SMTP_USER:-}
+      CARD_SMTP_PASSWORD: ${CARD_SMTP_PASSWORD:-}
+      CARD_SMTP_FROM: ${CARD_SMTP_FROM:-}
+      CARD_SMTP_STARTTLS: ${CARD_SMTP_STARTTLS:-true}
+      CARD_PUBLIC_BASE_URL: ${CARD_PUBLIC_BASE_URL:-}
+      CARD_CORS_ORIGINS: ${CARD_CORS_ORIGINS:-}
+      CARD_APP_VERSION: ${CARD_APP_VERSION:-dev}
+      CARD_GIT_SHA: ${CARD_GIT_SHA:-unknown}
       TZ: ${TZ:-Asia/Shanghai}
     depends_on:
       mysql:

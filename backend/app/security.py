@@ -64,7 +64,13 @@ DEVELOPER_PERMISSIONS = [
 
 ROLE_PERMISSIONS = {
     ROLE_DEVELOPER: DEVELOPER_PERMISSIONS,
-    ROLE_ADMIN: ["softView", "softCreate", "softEdit", "softDelete", "authCreate", "accountManage"],
+    ROLE_ADMIN: [
+        "softView", "softCreate", "softEdit", "softDelete",
+        "authCreate", "authDelete", "authExport", "authUnbind",
+        "userView", "cloudVarView", "cloudVarAdd", "cloudVarDelete",
+        "blackWhiteView", "blackWhiteAdd", "blackWhiteDelete",
+        "accountManage", "eventView",
+    ],
     ROLE_USER: ["softView", "authCreate"],
 }
 
@@ -105,10 +111,10 @@ def _unb64(data: str) -> bytes:
     return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
 
 
-def create_token(subject: str, expires_minutes: int | None = None) -> str:
+def create_token(subject: str, expires_minutes: int | None = None, token_version: int = 0) -> str:
     settings = get_settings()
     exp = datetime.utcnow() + timedelta(minutes=expires_minutes or settings.token_expire_minutes)
-    payload = {"sub": subject, "exp": int(exp.timestamp())}
+    payload = {"sub": subject, "exp": int(exp.timestamp()), "ver": token_version}
     body = _b64(json.dumps(payload, separators=(",", ":")).encode())
     sig = hmac.new(settings.secret_key.encode(), body.encode(), hashlib.sha256).digest()
     return f"{body}.{_b64(sig)}"
@@ -129,13 +135,22 @@ def decode_token(raw: str) -> dict[str, Any]:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="token 失效了") from exc
 
 
-def current_user(token: str | None = Header(default=None), db: Session = Depends(get_db)) -> AdminUser:
-    if not token:
+def current_user(
+    token: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> AdminUser:
+    raw = token
+    if authorization and authorization.lower().startswith("bearer "):
+        raw = authorization[7:].strip()
+    if not raw:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="缺少 token")
-    payload = decode_token(token)
+    payload = decode_token(raw)
     user = db.query(AdminUser).filter(AdminUser.user == payload["sub"]).first()
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户不存在")
+    if int(payload.get("ver", 0)) != int(user.token_version or 0):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="会话已失效")
     return user
 
 

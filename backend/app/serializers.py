@@ -54,6 +54,9 @@ def software_dict(row: SoftwareInstance, include_secret: bool = False) -> dict:
         "notice": row.notice,
         "visit": row.visit,
         "md5": row.md5,
+        "sha256": row.sha256,
+        "protocolVersion": row.protocol_version,
+        "strictClientAuth": row.strict_client_auth,
         "createTime": now_text(row.created_at),
         "lasttime": now_text(row.lasttime or row.updated_at),
     }
@@ -71,7 +74,6 @@ def auth_dict(row: AuthCard) -> dict:
         "_id": str(row.id),
         "id": row.id,
         "authId": row.auth_id,
-        "privateKey": row.private_key,
         "softwareId": row.software_id,
         "status": row.status == "active",
         "state": row.status,

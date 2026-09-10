@@ -55,7 +55,6 @@ def seed_database(db: Session) -> None:
             AuthCard(
                 owner_id=admin.id,
                 software_id=soft.software_id,
-                private_key=soft.software_id,
                 auth_id=random_code("KM", 18),
                 creator_id=admin.id,
                 creator_user=admin.user,
@@ -66,7 +65,6 @@ def seed_database(db: Session) -> None:
             AuthCard(
                 owner_id=admin.id,
                 software_id=soft.software_id,
-                private_key=soft.software_id,
                 auth_id=random_code("KM", 18),
                 status="active",
                 macid="DEMO-MACHINE",
@@ -100,7 +98,7 @@ def seed_database(db: Session) -> None:
                     type="api",
                     keyword="verify",
                     software_id=soft.software_id,
-                    auth_id=cards[0].auth_id,
+                    auth_id=f"last4:{cards[0].auth_id[-4:]}",
                     macid=f"DEMO-{idx}",
                     result="success",
                     message="演示验证日志",

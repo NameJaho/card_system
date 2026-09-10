@@ -1,20 +1,32 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import hmac
 import io
 import json
-from datetime import datetime, timedelta
+import re
+import secrets
+import smtplib
+import zipfile
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from sqlalchemy import and_, inspect, or_, text
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from packaging.version import InvalidVersion, Version
+from sqlalchemy import and_, or_, text
 from sqlalchemy.orm import Session
 
 from .database import Base, SessionLocal, engine, get_db
-from .models import AdminUser, AuthCard, BlackWhiteItem, CloudVariable, Customer, EventLog, Message, SoftwareInstance
+from .config import get_settings, validate_production_settings
+from .models import AdminUser, AuthCard, BlackWhiteItem, CloudVariable, Customer, EventLog, Message, PasswordResetToken, SoftwareInstance
 from .security import (
     create_token,
     current_user,
@@ -43,23 +55,24 @@ from .serializers import (
     software_dict,
     user_dict,
 )
-from .utils import fail, ok, paged, parse_time_range, random_code
+from .utils import api_error, fail, ok, paged, parse_time_range, random_code, rate_limiter
 
 
+settings = get_settings()
 app = FastAPI(title="Card System API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=list(settings.cors_origins),
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "token"],
 )
 
 
 @app.on_event("startup")
 def startup() -> None:
+    validate_production_settings(get_settings())
     Base.metadata.create_all(bind=engine)
-    migrate_schema()
     with SessionLocal() as db:
         seed_database(db)
 
@@ -72,58 +85,32 @@ class AnyBody(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class LicenseValidateBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    softwareId: str = Field(min_length=1, max_length=80)
+    licenseKey: str = Field(min_length=1, max_length=120)
+    installationId: str = Field(min_length=1, max_length=255)
+    clientVersion: str = Field(min_length=1, max_length=80)
+
+    @field_validator("softwareId", "licenseKey", "installationId", "clientVersion")
+    @classmethod
+    def strip_non_empty(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be blank")
+        return value
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    if request.url.path.startswith("/api/client/v1/"):
+        return api_error("INVALID_REQUEST", "请求字段缺失或格式错误", 422)
+    return await request_validation_exception_handler(request, exc)
+
+
 def body_dict(body: AnyBody | None) -> dict[str, Any]:
     return body.model_dump() if body else {}
-
-
-def migrate_schema() -> None:
-    columns = {column["name"] for column in inspect(engine).get_columns("admin_users")}
-    if "role" not in columns:
-        with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE admin_users ADD COLUMN role VARCHAR(30)"))
-            conn.execute(text("UPDATE admin_users SET role = 'admin' WHERE parent_id IS NULL"))
-            conn.execute(text("UPDATE admin_users SET role = 'user' WHERE parent_id IS NOT NULL"))
-    else:
-        with engine.begin() as conn:
-            conn.execute(text("UPDATE admin_users SET role = 'admin' WHERE (role IS NULL OR role = '') AND parent_id IS NULL"))
-            conn.execute(text("UPDATE admin_users SET role = 'user' WHERE (role IS NULL OR role = '') AND parent_id IS NOT NULL"))
-    auth_columns = {column["name"] for column in inspect(engine).get_columns("auth_cards")}
-    with engine.begin() as conn:
-        if "creator_id" not in auth_columns:
-            conn.execute(text("ALTER TABLE auth_cards ADD COLUMN creator_id INTEGER"))
-        if "creator_user" not in auth_columns:
-            conn.execute(text("ALTER TABLE auth_cards ADD COLUMN creator_user VARCHAR(80) DEFAULT ''"))
-        if "creator_role" not in auth_columns:
-            conn.execute(text("ALTER TABLE auth_cards ADD COLUMN creator_role VARCHAR(30) DEFAULT ''"))
-        conn.execute(text("UPDATE auth_cards SET creator_id = owner_id WHERE creator_id IS NULL"))
-        conn.execute(
-            text(
-                """
-                UPDATE auth_cards
-                SET creator_user = COALESCE((SELECT admin_users.user FROM admin_users WHERE admin_users.id = auth_cards.creator_id), '')
-                WHERE creator_user IS NULL OR creator_user = ''
-                """
-            )
-        )
-        conn.execute(
-            text(
-                """
-                UPDATE auth_cards
-                SET creator_role = COALESCE((SELECT admin_users.role FROM admin_users WHERE admin_users.id = auth_cards.creator_id), 'user')
-                WHERE creator_role IS NULL OR creator_role = ''
-                """
-            )
-        )
-    software_columns = {column["name"] for column in inspect(engine).get_columns("software_instances")}
-    if "instance_key" not in software_columns:
-        with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE software_instances ADD COLUMN instance_key VARCHAR(80) DEFAULT ''"))
-    with SessionLocal() as db:
-        rows = db.query(SoftwareInstance).filter(or_(SoftwareInstance.instance_key.is_(None), SoftwareInstance.instance_key == "")).all()
-        for row in rows:
-            row.instance_key = random_code("IK", 32)
-        if rows:
-            db.commit()
 
 
 def is_developer(user: AdminUser) -> bool:
@@ -169,6 +156,15 @@ def normalize_software_ids(value: Any) -> list[str]:
     return []
 
 
+def request_ip(request: Request | None) -> str | None:
+    if not request:
+        return None
+    forwarded = str(request.headers.get("x-real-ip") or "").strip()
+    if forwarded:
+        return forwarded[:80]
+    return request.client.host[:80] if request.client else None
+
+
 def add_event(
     db: Session,
     owner_id: int | None,
@@ -184,7 +180,7 @@ def add_event(
             type=type_,
             keyword=keyword,
             message=message,
-            ip=request.client.host if request and request.client else None,
+            ip=request_ip(request),
             result=kwargs.pop("result", "success"),
             software_id=kwargs.pop("software_id", None),
             auth_id=kwargs.pop("auth_id", None),
@@ -197,12 +193,19 @@ def add_event(
 def visible_software_query(db: Session, user: AdminUser):
     q = db.query(SoftwareInstance)
     role = normalize_role(user.role)
-    if role in (ROLE_DEVELOPER, ROLE_ADMIN):
+    if role == ROLE_DEVELOPER:
         return q
+    owner_id = owner_id_for(user)
+    if role == ROLE_ADMIN:
+        return q.filter(SoftwareInstance.owner_id == owner_id)
     scope = software_scope(user)
     if "*" in scope:
-        return q.filter(SoftwareInstance.owner_id == owner_id_for(user))
-    return q.filter(SoftwareInstance.software_id.in_(scope or [""]))
+        return q.filter(SoftwareInstance.owner_id == owner_id)
+    return q.filter(SoftwareInstance.owner_id == owner_id, SoftwareInstance.software_id.in_(scope or [""]))
+
+
+def tenant_query(db: Session, model, user: AdminUser):
+    return db.query(model).filter(model.owner_id == owner_id_for(user))
 
 
 def visible_software_ids(db: Session, user: AdminUser) -> list[str]:
@@ -234,7 +237,8 @@ def client_software_or_fail(db: Session, data: dict[str, Any]) -> tuple[Software
     if not soft:
         return None, "实例不存在"
     incoming_key = str(data.get("instanceKey") or data.get("privateKey") or "").strip()
-    if incoming_key and soft.instance_key and incoming_key != soft.instance_key:
+    stored_key = str(soft.instance_key or "").strip()
+    if not incoming_key or not stored_key or not hmac.compare_digest(incoming_key, stored_key):
         return None, "实例密钥错误"
     return soft, ""
 
@@ -252,6 +256,7 @@ AUTH_STATUS_ALIASES = {
     "unused": "unused",
     "expired": "expired",
     "disabled": "disabled",
+    "revoked": "revoked",
 }
 
 
@@ -296,21 +301,46 @@ def apply_auth_filters(query, data: dict[str, Any]):
     return query
 
 
+def valid_sha256(value: Any) -> bool:
+    raw = text_value(value)
+    return not raw or bool(re.fullmatch(r"[0-9a-fA-F]{64}", raw))
+
+
 @app.get("/health")
-def health():
-    return ok({"status": "ok"})
+def health(db: Session = Depends(get_db)):
+    settings = get_settings()
+    schema_version = settings.schema_version
+    try:
+        schema_version = str(db.execute(text("SELECT version_num FROM alembic_version")).scalar_one())
+    except Exception:
+        db.rollback()
+    return ok(
+        {
+            "status": "ok",
+            "appVersion": settings.app_version,
+            "gitSha": settings.git_sha,
+            "schemaVersion": schema_version,
+            "protocolVersion": "v1",
+            "sdkVersion": "1.0.0",
+        }
+    )
 
 
 @app.post("/api/adm/login")
 def login(body: AnyBody, request: Request, db: Session = Depends(get_db)):
     data = body_dict(body)
+    ip = request_ip(request) or "unknown"
+    if not rate_limiter.allow(f"adm-login:{ip}", 30, 60):
+        return fail("请求过于频繁", status_code=429, error_code="RATE_LIMITED", retryable=True)
     user = db.query(AdminUser).filter(AdminUser.user == data.get("user", "")).first()
     if not user or not verify_password(str(data.get("password", "")), user.password_hash):
+        add_event(db, None, "security", "login", "后台登录失败", request, result="failed")
+        db.commit()
         return fail("账号或密码错误")
     if data.get("fingerId"):
         user.finger_id = str(data["fingerId"])
     user.last_login = datetime.utcnow()
-    token = create_token(user.user)
+    token = create_token(user.user, token_version=user.token_version or 0)
     add_event(db, owner_id_for(user), "login", user.user, "后台登录成功", request, result="success")
     db.commit()
     res = user_dict(user, include_private=is_developer(user))
@@ -321,10 +351,15 @@ def login(body: AnyBody, request: Request, db: Session = Depends(get_db)):
 @app.post("/api/adm/fingerLogin")
 def finger_login(body: AnyBody, request: Request, db: Session = Depends(get_db)):
     data = body_dict(body)
+    ip = request_ip(request) or "unknown"
+    if not rate_limiter.allow(f"finger-login:{ip}", 30, 60):
+        return fail("请求过于频繁", status_code=429, error_code="RATE_LIMITED", retryable=True)
     user = db.query(AdminUser).filter(AdminUser.user == data.get("user", ""), AdminUser.finger_id == data.get("fingerId", "")).first()
     if not user:
+        add_event(db, None, "security", "fingerLogin", "免密码登录失败", request, result="failed")
+        db.commit()
         return fail("免密码登录失败")
-    token = create_token(user.user)
+    token = create_token(user.user, token_version=user.token_version or 0)
     add_event(db, owner_id_for(user), "login", user.user, "免密码登录成功", request)
     db.commit()
     res = user_dict(user, include_private=is_developer(user))
@@ -338,31 +373,110 @@ def register(body: AnyBody, db: Session = Depends(get_db)):
 
 
 @app.post("/api/adm/forgotPassword")
-def forgot_password(body: AnyBody, db: Session = Depends(get_db)):
+def forgot_password(body: AnyBody, request: Request, db: Session = Depends(get_db)):
     data = body_dict(body)
-    user = db.query(AdminUser).filter(AdminUser.email == data.get("email", "")).first()
+    settings = get_settings()
+    email = str(data.get("email") or "").strip().lower()
+    ip = request_ip(request) or "unknown"
+    if not rate_limiter.allow(f"reset-ip:{ip}", 10, 3600) or not rate_limiter.allow(f"reset-email:{email}", 5, 3600):
+        return fail("请求过于频繁", status_code=429, error_code="RATE_LIMITED", retryable=True)
+    if not settings.allow_dev_reset_link and not settings.smtp_host:
+        return fail("密码重置服务暂不可用", status_code=503, error_code="RESET_UNAVAILABLE", retryable=True)
+
+    generic_message = "如果该邮箱已注册，重置邮件将很快发送"
+    user = db.query(AdminUser).filter(AdminUser.email == email).first()
     if not user:
-        return fail("邮箱不存在")
-    reset_token = create_token(f"reset:{user.user}", expires_minutes=30)
-    return ok({"resetToken": reset_token}, "发送成功,请查收邮件")
+        return ok(None, generic_message)
+
+    raw_token = secrets.token_urlsafe(48)
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    now = datetime.utcnow()
+    db.query(PasswordResetToken).filter(
+        PasswordResetToken.user_id == user.id,
+        PasswordResetToken.used_at.is_(None),
+    ).update({"used_at": now}, synchronize_session=False)
+    reset = PasswordResetToken(
+        user_id=user.id,
+        token_hash=token_hash,
+        expires_at=now + timedelta(minutes=settings.password_reset_minutes),
+        requested_ip=ip,
+    )
+    db.add(reset)
+    db.commit()
+
+    if settings.allow_dev_reset_link:
+        return ok({"resetToken": raw_token}, generic_message)
+
+    reset_url = f"{settings.public_base_url}/#/reset-password?token={raw_token}"
+    message = EmailMessage()
+    message["Subject"] = "KeyDesk 密码重置"
+    message["From"] = settings.smtp_from or settings.smtp_user
+    message["To"] = user.email
+    message.set_content(f"请在 {settings.password_reset_minutes} 分钟内打开以下链接重置密码：\n\n{reset_url}\n")
+    try:
+        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=10) as smtp:
+            if settings.smtp_starttls:
+                smtp.starttls()
+            if settings.smtp_user:
+                smtp.login(settings.smtp_user, settings.smtp_password)
+            smtp.send_message(message)
+    except Exception:
+        reset.used_at = datetime.utcnow()
+        add_event(db, owner_id_for(user), "security", "passwordResetEmail", "密码重置邮件发送失败", request, result="failed")
+        db.commit()
+        return ok(None, generic_message)
+    return ok(None, generic_message)
 
 
 @app.post("/api/adm/resetUserPassword")
-def reset_user_password(body: AnyBody, db: Session = Depends(get_db)):
+def reset_user_password(body: AnyBody, request: Request, db: Session = Depends(get_db)):
     data = body_dict(body)
-    user = db.query(AdminUser).filter(or_(AdminUser.email == data.get("email", ""), AdminUser.user == data.get("user", ""))).first()
+    raw_token = str(data.get("token") or "").strip()
+    password = str(data.get("password") or "")
+    ip = request_ip(request) or "unknown"
+    if not rate_limiter.allow(f"reset-consume:{ip}", 20, 3600):
+        return fail("请求过于频繁", status_code=429, error_code="RATE_LIMITED", retryable=True)
+    if not raw_token or len(password) < 8:
+        return fail("重置令牌无效或新密码少于 8 位", error_code="RESET_TOKEN_INVALID")
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    now = datetime.utcnow()
+    reset = db.query(PasswordResetToken).filter(PasswordResetToken.token_hash == token_hash).first()
+    if not reset:
+        return fail("重置令牌无效或已过期", error_code="RESET_TOKEN_INVALID")
+    consumed = db.query(PasswordResetToken).filter(
+        PasswordResetToken.id == reset.id,
+        PasswordResetToken.used_at.is_(None),
+        PasswordResetToken.expires_at > now,
+    ).update({"used_at": now}, synchronize_session=False)
+    if consumed != 1:
+        db.rollback()
+        return fail("重置令牌无效或已过期", error_code="RESET_TOKEN_INVALID")
+    user = db.query(AdminUser).filter(AdminUser.id == reset.user_id).first()
     if not user:
-        return fail("用户不存在")
-    if not data.get("password"):
-        return fail("新密码不能为空")
-    user.password_hash = hash_password(data["password"])
+        db.rollback()
+        return fail("重置令牌无效或已过期", error_code="RESET_TOKEN_INVALID")
+    user.password_hash = hash_password(password)
+    user.token_version = (user.token_version or 0) + 1
+    add_event(db, owner_id_for(user), "security", "passwordReset", "密码重置成功", request)
     db.commit()
     return ok()
 
 
 @app.post("/api/adm/rePasswordInfo")
-def re_password_info(body: AnyBody):
-    return ok({"valid": True, "token": body_dict(body).get("token")})
+def re_password_info(body: AnyBody, request: Request, db: Session = Depends(get_db)):
+    raw_token = str(body_dict(body).get("token") or "").strip()
+    ip = request_ip(request) or "unknown"
+    if not rate_limiter.allow(f"reset-info:{ip}", 30, 3600):
+        return fail("请求过于频繁", status_code=429, error_code="RATE_LIMITED", retryable=True)
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest() if raw_token else ""
+    row = db.query(PasswordResetToken).filter(
+        PasswordResetToken.token_hash == token_hash,
+        PasswordResetToken.used_at.is_(None),
+        PasswordResetToken.expires_at > datetime.utcnow(),
+    ).first()
+    if not row:
+        return fail("重置令牌无效或已过期", error_code="RESET_TOKEN_INVALID")
+    return ok({"valid": True})
 
 
 @app.post("/api/adm/user")
@@ -380,6 +494,7 @@ def update_user_info(body: AnyBody, db: Session = Depends(get_db), user: AdminUs
             setattr(user, attr, str(data[field]))
     if data.get("password"):
         user.password_hash = hash_password(data["password"])
+        user.token_version = (user.token_version or 0) + 1
     db.commit()
     return ok(user_dict(user, include_private=is_developer(user)))
 
@@ -393,12 +508,18 @@ def clear_finger(db: Session = Depends(get_db), user: AdminUser = Depends(curren
 
 @app.post("/api/adm/user-config")
 def user_config(user: AdminUser = Depends(current_user)):
+    settings = get_settings()
     return ok(
         {
             "gitcodeProjectUrl": getattr(user, "gitcode_project_url", None),
             "gitcodeToken": None,
             "gitcodeName": None,
             "gitcodeRepo": None,
+            "publicBaseUrl": settings.public_base_url,
+            "appVersion": settings.app_version,
+            "gitSha": settings.git_sha,
+            "schemaVersion": settings.schema_version,
+            "protocolVersion": "v1",
         }
     )
 
@@ -438,6 +559,52 @@ def software_select(user: AdminUser = Depends(current_user), db: Session = Depen
     return ok([software_dict(row, include_secret=True) for row in rows])
 
 
+@app.post("/api/adm/clientPackage")
+def client_package(body: AnyBody, user: AdminUser = Depends(require_permission("softView")), db: Session = Depends(get_db)):
+    software = get_software_or_404(db, user, text_value(body_dict(body).get("softwareId")))
+    candidates = [
+        Path(__file__).resolve().parents[2] / "clients" / "python" / "keydesk_client.py",
+        Path("/app/client_sdk/keydesk.py"),
+    ]
+    sdk_path = next((path for path in candidates if path.exists()), None)
+    if not sdk_path:
+        return fail("SDK 文件未随服务部署", status_code=503, error_code="SDK_PACKAGE_UNAVAILABLE", retryable=True)
+    config = {
+        "baseUrl": get_settings().public_base_url,
+        "softwareId": software.software_id,
+        "version": software.version,
+    }
+    example = (
+        "from keydesk import KeyDesk, LicenseError\n\n"
+        "license = KeyDesk.from_file('keydesk.json')\n"
+        "try:\n"
+        "    license.require_license(prompt=lambda: input('请输入卡密：').strip())\n"
+        "except LicenseError as exc:\n"
+        "    raise SystemExit(f'授权失败 [{exc.error_code}]: {exc}')\n"
+    )
+    smoke = (
+        "import os\n"
+        "from keydesk import KeyDesk\n\n"
+        "key = os.environ.get('KEYDESK_TEST_LICENSE') or input('测试卡密：').strip()\n"
+        "result = KeyDesk.from_file('keydesk.json').require_license(key)\n"
+        "print('OK', result['status'], result.get('serverTime'))\n"
+    )
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("keydesk.py", sdk_path.read_text(encoding="utf-8"))
+        archive.writestr("keydesk.json", json.dumps(config, ensure_ascii=False, indent=2) + "\n")
+        archive.writestr("example.py", example)
+        archive.writestr("smoke_test.py", smoke)
+        archive.writestr("README.txt", "运行 python example.py。首版 v1 必须在线验证；不要关闭 TLS 校验。\n")
+    output.seek(0)
+    filename = f"keydesk-{software.software_id}-python-v1.zip"
+    return StreamingResponse(
+        output,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.post("/api/adm/createSoftware")
 def create_software(body: AnyBody, db: Session = Depends(get_db), user: AdminUser = Depends(require_permission("softCreate"))):
     data = body_dict(body)
@@ -445,6 +612,8 @@ def create_software(body: AnyBody, db: Session = Depends(get_db), user: AdminUse
         return fail("请输入信息")
     if "|" in data["name"]:
         return fail("请不要使用关键字符 |")
+    if not valid_sha256(data.get("sha256")):
+        return fail("SHA-256 必须是 64 位十六进制字符串")
     row = SoftwareInstance(
         owner_id=owner_id_for(user),
         name=data["name"],
@@ -457,6 +626,9 @@ def create_software(body: AnyBody, db: Session = Depends(get_db), user: AdminUse
         url=data.get("url") or None,
         notice=str(data.get("notice") or ""),
         md5=data.get("md5") or None,
+        sha256=data.get("sha256") or None,
+        protocol_version="v1",
+        strict_client_auth=True,
     )
     db.add(row)
     db.commit()
@@ -466,6 +638,8 @@ def create_software(body: AnyBody, db: Session = Depends(get_db), user: AdminUse
 @app.post("/api/adm/updateSoftware")
 def update_software(body: AnyBody, db: Session = Depends(get_db), user: AdminUser = Depends(require_permission("softEdit"))):
     data = body_dict(body)
+    if not valid_sha256(data.get("sha256")):
+        return fail("SHA-256 必须是 64 位十六进制字符串")
     row = get_software_or_404(db, user, data.get("softwareId", ""))
     mapping = {
         "name": "name",
@@ -476,6 +650,7 @@ def update_software(body: AnyBody, db: Session = Depends(get_db), user: AdminUse
         "url": "url",
         "notice": "notice",
         "md5": "md5",
+        "sha256": "sha256",
     }
     for key, attr in mapping.items():
         if key in data:
@@ -485,6 +660,16 @@ def update_software(body: AnyBody, db: Session = Depends(get_db), user: AdminUse
         row.instance_key = random_code("IK", 32)
     db.commit()
     return ok(software_dict(row, include_secret=True))
+
+
+@app.post("/api/adm/rotateInstanceKey")
+def rotate_instance_key(body: AnyBody, request: Request, db: Session = Depends(get_db), user: AdminUser = Depends(require_permission("softEdit"))):
+    row = get_software_or_404(db, user, text_value(body_dict(body).get("softwareId")))
+    row.instance_key = random_code("IK", 32)
+    row.updated_at = datetime.utcnow()
+    add_event(db, row.owner_id, "security", "rotateInstanceKey", "旧协议实例密钥已轮换", request, software_id=row.software_id)
+    db.commit()
+    return ok(software_dict(row, include_secret=True), "实例密钥已轮换")
 
 
 @app.post("/api/adm/delSoftware")
@@ -539,7 +724,6 @@ def create_auth(body: AnyBody, db: Session = Depends(get_db), user: AdminUser = 
         row = AuthCard(
             owner_id=software.owner_id,
             software_id=software.software_id,
-            private_key=software.software_id,
             auth_id=random_code("KM", 20),
             creator_id=user.id,
             creator_user=user.user,
@@ -568,7 +752,7 @@ def edit_auth(body: AnyBody, db: Session = Depends(get_db), user: AdminUser = De
 
 
 @app.post("/api/adm/commitUnBind")
-def commit_unbind(body: AnyBody, db: Session = Depends(get_db), user: AdminUser = Depends(require_permission("authUnbind"))):
+def commit_unbind(body: AnyBody, request: Request, db: Session = Depends(get_db), user: AdminUser = Depends(require_permission("authUnbind"))):
     data = body_dict(body)
     row = visible_auth_query(db, user).filter(AuthCard.auth_id == data.get("authId")).first()
     if not row:
@@ -576,8 +760,43 @@ def commit_unbind(body: AnyBody, db: Session = Depends(get_db), user: AdminUser 
     row.macid = data.get("macid") or None
     if row.macid is None:
         row.bind_used = 0
+        row.status = "unused"
+    else:
+        row.status = "active"
+    add_event(
+        db,
+        row.owner_id,
+        "security",
+        "explicitRebind",
+        "管理员显式解绑" if row.macid is None else "管理员显式换绑",
+        request,
+        software_id=row.software_id,
+        auth_id=credential_hint(row.auth_id),
+        macid=row.macid,
+    )
     db.commit()
     return ok(auth_dict(row))
+
+
+@app.post("/api/adm/revokeAuth")
+def revoke_auth(body: AnyBody, request: Request, db: Session = Depends(get_db), user: AdminUser = Depends(require_permission("authUnbind"))):
+    row = visible_auth_query(db, user).filter(AuthCard.auth_id == body_dict(body).get("authId")).first()
+    if not row:
+        return fail("卡密不存在")
+    row.status = "revoked"
+    add_event(
+        db,
+        row.owner_id,
+        "security",
+        "revokeAuth",
+        "卡密已撤销",
+        request,
+        software_id=row.software_id,
+        auth_id=credential_hint(row.auth_id),
+        macid=row.macid,
+    )
+    db.commit()
+    return ok(auth_dict(row), "卡密已撤销")
 
 
 @app.post("/api/adm/updateAuthRemark")
@@ -639,7 +858,7 @@ def assign_auth_to_sub_user(body: AnyBody, db: Session = Depends(get_db), user: 
 @app.post("/api/adm/customerList")
 def customer_list(body: AnyBody, db: Session = Depends(get_db), user: AdminUser = Depends(require_permission("userView"))):
     data = body_dict(body)
-    q = db.query(Customer).filter(Customer.owner_id == owner_id_for(user)).order_by(Customer.created_at.desc())
+    q = tenant_query(db, Customer, user).order_by(Customer.created_at.desc())
     if data.get("email"):
         q = q.filter(Customer.email.contains(data["email"]))
     if data.get("customerId"):
@@ -650,7 +869,7 @@ def customer_list(body: AnyBody, db: Session = Depends(get_db), user: AdminUser 
 @app.post("/api/adm/delCustomer")
 def del_customer(body: AnyBody, db: Session = Depends(get_db), user: AdminUser = Depends(require_permission("userView"))):
     data = body_dict(body)
-    row = db.query(Customer).filter(Customer.owner_id == owner_id_for(user), Customer.customer_id == data.get("customerId")).first()
+    row = tenant_query(db, Customer, user).filter(Customer.customer_id == data.get("customerId")).first()
     if row:
         db.delete(row)
         db.commit()
@@ -659,7 +878,7 @@ def del_customer(body: AnyBody, db: Session = Depends(get_db), user: AdminUser =
 
 @app.post("/api/adm/cloudVariablesList")
 def cloud_variables_list(user: AdminUser = Depends(require_permission("cloudVarView")), db: Session = Depends(get_db)):
-    rows = db.query(CloudVariable).filter(CloudVariable.owner_id == owner_id_for(user)).all()
+    rows = tenant_query(db, CloudVariable, user).all()
     return ok({"variables": json.dumps([cloud_var_dict(row) for row in rows], ensure_ascii=False)})
 
 
@@ -678,7 +897,7 @@ def save_cloud_variables(body: AnyBody, db: Session = Depends(get_db), user: Adm
         if key in seen:
             return fail(f"变量名重复: {item.get('key')}")
         seen.add(key)
-    db.query(CloudVariable).filter(CloudVariable.owner_id == owner_id).delete()
+    tenant_query(db, CloudVariable, user).delete()
     for item in variables:
         if item.get("key"):
             db.add(CloudVariable(owner_id=owner_id, key=item["key"], value=item.get("value") or "", status=item.get("status") or "y", software_id=item.get("softwareId") or ""))
@@ -688,7 +907,7 @@ def save_cloud_variables(body: AnyBody, db: Session = Depends(get_db), user: Adm
 
 @app.post("/api/adm/blackWhiteList")
 def black_white_list(user: AdminUser = Depends(require_permission("blackWhiteView")), db: Session = Depends(get_db)):
-    rows = db.query(BlackWhiteItem).filter(BlackWhiteItem.owner_id == owner_id_for(user)).all()
+    rows = tenant_query(db, BlackWhiteItem, user).all()
     return ok({"list": [black_white_dict(row) for row in rows]})
 
 
@@ -707,7 +926,7 @@ def save_black_white_list(body: AnyBody, db: Session = Depends(get_db), user: Ad
         if key in seen:
             return fail(f"{item.get('type')} 值重复: {item.get('value')}")
         seen.add(key)
-    db.query(BlackWhiteItem).filter(BlackWhiteItem.owner_id == owner_id).delete()
+    tenant_query(db, BlackWhiteItem, user).delete()
     for item in items:
         if item.get("value"):
             db.add(BlackWhiteItem(owner_id=owner_id, type=item.get("type") or "white", value=item["value"], remark=item.get("remark") or "", software_id=item.get("softwareId") or ""))
@@ -718,7 +937,7 @@ def save_black_white_list(body: AnyBody, db: Session = Depends(get_db), user: Ad
 @app.post("/api/adm/message/event")
 def message_event(body: AnyBody, db: Session = Depends(get_db), user: AdminUser = Depends(require_permission("eventView"))):
     data = body_dict(body)
-    q = db.query(EventLog).filter(EventLog.owner_id == owner_id_for(user)).order_by(EventLog.created_at.desc())
+    q = tenant_query(db, EventLog, user).order_by(EventLog.created_at.desc())
     if data.get("type"):
         q = q.filter(EventLog.type == data["type"])
     if data.get("keyword"):
@@ -734,7 +953,7 @@ def message_event(body: AnyBody, db: Session = Depends(get_db), user: AdminUser 
 
 @app.post("/api/adm/message/list")
 def message_list(db: Session = Depends(get_db), user: AdminUser = Depends(require_permission("messageManage"))):
-    rows = db.query(Message).filter(Message.owner_id == owner_id_for(user)).order_by(Message.created_at.desc()).limit(50).all()
+    rows = tenant_query(db, Message, user).order_by(Message.created_at.desc()).limit(50).all()
     return ok([message_dict(row) for row in rows])
 
 
@@ -801,6 +1020,7 @@ def update_sub_user(body: AnyBody, db: Session = Depends(get_db), user: AdminUse
     row.nick = data.get("nick") or row.nick
     if data.get("password"):
         row.password_hash = hash_password(data["password"])
+        row.token_version = (row.token_version or 0) + 1
     row.role = role
     row.parent_id = parent_id_for_role(user, role, row.parent_id)
     software_ids = normalize_software_ids(data.get("softwareIds"))
@@ -859,7 +1079,7 @@ def auth_duration(card: AuthCard) -> timedelta | None:
 
 def check_black_white(db: Session, owner_id: int, software_id: str, macid: str | None) -> tuple[bool, str]:
     if not macid:
-        return True, ""
+        return False, "设备码不能为空"
     rows = db.query(BlackWhiteItem).filter(BlackWhiteItem.owner_id == owner_id, BlackWhiteItem.software_id.in_([software_id, ""])).all()
     blacks = {row.value.lower() for row in rows if row.type == "black"}
     whites = {row.value.lower() for row in rows if row.type == "white"}
@@ -871,100 +1091,303 @@ def check_black_white(db: Session, owner_id: int, software_id: str, macid: str |
     return True, ""
 
 
-@app.post("/api/client/software/checkUpdate")
+def credential_hint(value: Any) -> str:
+    raw = str(value or "")
+    if not raw:
+        return "missing"
+    digest = hashlib.sha256(raw.encode()).hexdigest()[:12]
+    return f"sha256:{digest}:last4:{raw[-4:]}"
+
+
+def utc_text(value: datetime | None = None) -> str:
+    current = value or datetime.utcnow()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return current.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def parse_version(value: str) -> Version | None:
+    try:
+        return Version(value.strip())
+    except InvalidVersion:
+        return None
+
+
+def update_result(soft: SoftwareInstance, client_version: str) -> dict[str, Any] | None:
+    client = parse_version(client_version)
+    latest = parse_version(soft.version or "")
+    minimum = parse_version(soft.low_version or "") if soft.low_version else None
+    if not client or not latest or (soft.low_version and not minimum):
+        return None
+    return {
+        "updateAvailable": client < latest,
+        "updateRequired": bool(minimum and client < minimum),
+        "latestVersion": soft.version,
+        "minimumVersion": soft.low_version,
+        "url": soft.url,
+        "notice": soft.notice,
+        "sha256": soft.sha256,
+    }
+
+
+LicenseFailure = tuple[str, str, int]
+
+
+def validate_license_card(
+    db: Session,
+    soft: SoftwareInstance,
+    license_key: str,
+    installation_id: str,
+    *,
+    activate_unused: bool,
+) -> tuple[AuthCard | None, LicenseFailure | None]:
+    if not license_key:
+        return None, ("LICENSE_KEY_REQUIRED", "卡密不能为空", 422)
+    if not installation_id:
+        return None, ("INSTALLATION_ID_REQUIRED", "设备码不能为空", 422)
+
+    card = (
+        db.query(AuthCard)
+        .filter(AuthCard.auth_id == license_key, AuthCard.software_id == soft.software_id)
+        .with_for_update()
+        .first()
+    )
+    if not card:
+        return None, ("LICENSE_NOT_FOUND", "卡密不存在", 404)
+    if card.status in {"disabled", "revoked"}:
+        return None, ("LICENSE_REVOKED", "卡密已禁用或撤销", 403)
+    now = datetime.utcnow()
+    if card.status == "expired" or (card.end_time and card.end_time <= now):
+        return None, ("LICENSE_EXPIRED", "卡密已过期", 403)
+
+    allowed, reason = check_black_white(db, card.owner_id, card.software_id, installation_id)
+    if not allowed:
+        return None, ("LICENSE_DEVICE_BLOCKED", reason, 403)
+
+    if card.status == "unused":
+        if not activate_unused:
+            return None, ("LICENSE_UNUSED", "卡密尚未激活", 409)
+        if card.macid and card.macid != installation_id:
+            return None, ("LICENSE_DEVICE_MISMATCH", "卡密已绑定其他设备", 409)
+        duration = auth_duration(card)
+        end_time = card.end_time or (now + duration if duration else None)
+        updated = (
+            db.query(AuthCard)
+            .filter(
+                AuthCard.id == card.id,
+                AuthCard.status == "unused",
+                or_(AuthCard.macid.is_(None), AuthCard.macid == "", AuthCard.macid == installation_id),
+            )
+            .update(
+                {
+                    "macid": installation_id,
+                    "status": "active",
+                    "activated_at": card.activated_at or now,
+                    "end_time": end_time,
+                },
+                synchronize_session=False,
+            )
+        )
+        if updated != 1:
+            db.rollback()
+            winner = db.query(AuthCard).filter(AuthCard.id == card.id).first()
+            if winner and winner.status == "active" and winner.macid == installation_id:
+                return winner, None
+            return None, ("LICENSE_DEVICE_MISMATCH", "卡密已由其他设备激活", 409)
+        db.expire(card)
+        db.refresh(card)
+        return card, None
+
+    if card.status != "active":
+        return None, ("LICENSE_INVALID_STATE", "卡密状态无效", 409)
+    if not card.macid or not hmac.compare_digest(card.macid, installation_id):
+        return None, ("LICENSE_DEVICE_MISMATCH", "卡密已绑定其他设备", 409)
+    return card, None
+
+
+def audit_license_result(
+    db: Session,
+    request: Request,
+    soft: SoftwareInstance,
+    action: str,
+    license_key: str,
+    installation_id: str,
+    *,
+    success: bool,
+    message: str,
+) -> None:
+    add_event(
+        db,
+        soft.owner_id,
+        "api",
+        action,
+        message,
+        request,
+        result="success" if success else "failed",
+        software_id=soft.software_id,
+        auth_id=credential_hint(license_key),
+        macid=installation_id,
+    )
+
+
+def legacy_license_failure(
+    db: Session,
+    request: Request,
+    soft: SoftwareInstance,
+    action: str,
+    license_key: str,
+    installation_id: str,
+    failure: LicenseFailure,
+):
+    code, message, _ = failure
+    audit_license_result(db, request, soft, action, license_key, installation_id, success=False, message=code)
+    db.commit()
+    return fail(message, error_code=code)
+
+
+@app.post("/api/client/software/checkUpdate", deprecated=True)
 def client_check_update(body: AnyBody, request: Request, db: Session = Depends(get_db)):
     data = body_dict(body)
     soft, error = client_software_or_fail(db, data)
     if not soft:
-        return fail(error)
+        return fail(error, error_code="INSTANCE_KEY_INVALID" if error == "实例密钥错误" else "SOFTWARE_NOT_FOUND")
+    version_data = update_result(soft, str(data.get("version") or ""))
+    if not version_data:
+        return fail("客户端版本格式错误", error_code="CLIENT_VERSION_INVALID")
     soft.visit += 1
     soft.lasttime = datetime.utcnow()
     add_event(db, soft.owner_id, "api", "checkUpdate", "检查更新", request, software_id=soft.software_id, macid=data.get("macid"))
     db.commit()
-    return ok(software_dict(soft))
+    payload = software_dict(soft)
+    payload.update(version_data)
+    payload["force"] = version_data["updateRequired"]
+    return ok(payload)
 
 
-@app.post("/api/client/auth/activate")
+@app.post("/api/client/auth/activate", deprecated=True)
 def client_auth_activate(body: AnyBody, request: Request, db: Session = Depends(get_db)):
     data = body_dict(body)
+    ip = request_ip(request) or "unknown"
+    if not rate_limiter.allow(f"license-activate:{ip}", 300, 60):
+        return fail("请求过于频繁", status_code=429, error_code="RATE_LIMITED", retryable=True)
     soft, error = client_software_or_fail(db, data)
     if not soft:
-        return fail(error)
-    card = db.query(AuthCard).filter(AuthCard.auth_id == data.get("authId"), AuthCard.software_id == soft.software_id).first()
-    if not card:
-        return fail("卡密不存在")
-    allowed, reason = check_black_white(db, card.owner_id, card.software_id, data.get("macid"))
-    if not allowed:
-        add_event(db, card.owner_id, "api", "activate", reason, request, result="failed", software_id=card.software_id, auth_id=card.auth_id, macid=data.get("macid"))
-        db.commit()
-        return fail(reason)
-    if card.status == "disabled":
-        return fail("卡密已禁用")
-    if card.macid and card.macid != data.get("macid"):
-        return fail("卡密已绑定其他设备")
-    card.macid = data.get("macid")
-    card.status = "active"
-    card.activated_at = card.activated_at or datetime.utcnow()
-    duration = auth_duration(card)
-    if duration and not card.end_time:
-        card.end_time = datetime.utcnow() + duration
-    add_event(db, card.owner_id, "api", "activate", "激活成功", request, software_id=card.software_id, auth_id=card.auth_id, macid=card.macid)
+        return fail(error, error_code="INSTANCE_KEY_INVALID" if error == "实例密钥错误" else "SOFTWARE_NOT_FOUND")
+    license_key = text_value(data.get("authId"))
+    installation_id = text_value(data.get("macid"))
+    card, failure = validate_license_card(db, soft, license_key, installation_id, activate_unused=True)
+    if failure:
+        return legacy_license_failure(db, request, soft, "activate", license_key, installation_id, failure)
+    audit_license_result(db, request, soft, "activate", license_key, installation_id, success=True, message="激活成功")
     db.commit()
+    assert card is not None
     return ok(auth_dict(card))
 
 
-@app.post("/api/client/auth/verify")
+@app.post("/api/client/auth/verify", deprecated=True)
 def client_auth_verify(body: AnyBody, request: Request, db: Session = Depends(get_db)):
     data = body_dict(body)
+    ip = request_ip(request) or "unknown"
+    if not rate_limiter.allow(f"license-verify:{ip}", 300, 60):
+        return fail("请求过于频繁", status_code=429, error_code="RATE_LIMITED", retryable=True)
     soft, error = client_software_or_fail(db, data)
     if not soft:
-        return fail(error)
-    card = db.query(AuthCard).filter(AuthCard.auth_id == data.get("authId"), AuthCard.software_id == soft.software_id).first()
-    if not card:
-        return fail("卡密不存在")
-    allowed, reason = check_black_white(db, card.owner_id, card.software_id, data.get("macid"))
-    if not allowed:
-        add_event(db, card.owner_id, "api", "verify", reason, request, result="failed", software_id=card.software_id, auth_id=card.auth_id, macid=data.get("macid"))
-        db.commit()
-        return fail(reason)
-    if card.end_time and card.end_time < datetime.utcnow():
-        card.status = "expired"
-        db.commit()
-        return fail("卡密已过期")
-    if not card.macid:
-        card.macid = data.get("macid")
-        card.status = "active"
-        card.activated_at = datetime.utcnow()
-        duration = auth_duration(card)
-        card.end_time = datetime.utcnow() + duration if duration else None
-    elif card.macid != data.get("macid"):
-        if card.bind_count is not None and card.bind_used >= card.bind_count:
-            return fail("换绑次数不足")
-        card.macid = data.get("macid")
-        card.bind_used += 1
-    add_event(db, card.owner_id, "api", "verify", "验证成功", request, software_id=card.software_id, auth_id=card.auth_id, macid=card.macid)
+        return fail(error, error_code="INSTANCE_KEY_INVALID" if error == "实例密钥错误" else "SOFTWARE_NOT_FOUND")
+    license_key = text_value(data.get("authId"))
+    installation_id = text_value(data.get("macid"))
+    card, failure = validate_license_card(db, soft, license_key, installation_id, activate_unused=False)
+    if failure:
+        return legacy_license_failure(db, request, soft, "verify", license_key, installation_id, failure)
+    audit_license_result(db, request, soft, "verify", license_key, installation_id, success=True, message="验证成功")
     db.commit()
+    assert card is not None
     return ok(auth_dict(card))
 
 
-@app.post("/api/client/auth/unbind")
+@app.post("/api/client/auth/unbind", deprecated=True)
 def client_auth_unbind(body: AnyBody, request: Request, db: Session = Depends(get_db)):
     data = body_dict(body)
     soft, error = client_software_or_fail(db, data)
     if not soft:
-        return fail(error)
-    card = db.query(AuthCard).filter(AuthCard.auth_id == data.get("authId"), AuthCard.software_id == soft.software_id).first()
-    if not card:
-        return fail("卡密不存在")
-    if card.macid != data.get("macid"):
-        return fail("设备码不匹配")
+        return fail(error, error_code="INSTANCE_KEY_INVALID" if error == "实例密钥错误" else "SOFTWARE_NOT_FOUND")
+    license_key = text_value(data.get("authId"))
+    installation_id = text_value(data.get("macid"))
+    card, failure = validate_license_card(db, soft, license_key, installation_id, activate_unused=False)
+    if failure:
+        return legacy_license_failure(db, request, soft, "unbind", license_key, installation_id, failure)
+    assert card is not None
     card.macid = None
-    add_event(db, card.owner_id, "api", "unbind", "解绑成功", request, software_id=card.software_id, auth_id=card.auth_id, macid=data.get("macid"))
+    card.status = "unused"
+    audit_license_result(db, request, soft, "unbind", license_key, installation_id, success=True, message="解绑成功")
     db.commit()
     return ok(auth_dict(card))
 
 
-@app.post("/api/client/cloudVariables/list")
+@app.post("/api/client/v1/license/validate")
+def client_license_validate(body: LicenseValidateBody, request: Request, db: Session = Depends(get_db)):
+    data = body.model_dump()
+    ip = request_ip(request) or "unknown"
+    rate_key = f"license-v1:{ip}:{credential_hint(data['licenseKey'])}"
+    if not rate_limiter.allow(rate_key, 300, 60):
+        return api_error("RATE_LIMITED", "请求过于频繁", 429, retryable=True)
+
+    soft = db.query(SoftwareInstance).filter(SoftwareInstance.software_id == data["softwareId"]).first()
+    if not soft:
+        return api_error("SOFTWARE_NOT_FOUND", "实例不存在", 404)
+    version_data = update_result(soft, data["clientVersion"])
+    if not version_data:
+        return api_error("CLIENT_VERSION_INVALID", "客户端版本格式错误", 422)
+
+    card, failure = validate_license_card(
+        db,
+        soft,
+        data["licenseKey"],
+        data["installationId"],
+        activate_unused=True,
+    )
+    if failure:
+        code, message, status_code = failure
+        audit_license_result(
+            db,
+            request,
+            soft,
+            "licenseValidate",
+            data["licenseKey"],
+            data["installationId"],
+            success=False,
+            message=code,
+        )
+        db.commit()
+        return api_error(code, message, status_code)
+
+    assert card is not None
+    soft.visit += 1
+    soft.lasttime = datetime.utcnow()
+    audit_license_result(
+        db,
+        request,
+        soft,
+        "licenseValidate",
+        data["licenseKey"],
+        data["installationId"],
+        success=True,
+        message="验证成功",
+    )
+    db.commit()
+    payload = {
+        "status": "active",
+        "expiresAt": utc_text(card.end_time) if card.end_time else None,
+        "serverTime": utc_text(),
+        "nextCheckAfterSeconds": 3600,
+        "offlineGraceSeconds": 0,
+        "leaseToken": None,
+        "requiresOnline": True,
+    }
+    payload.update(version_data)
+    return ok(payload)
+
+
+@app.post("/api/client/cloudVariables/list", deprecated=True)
 def client_cloud_vars(body: AnyBody, db: Session = Depends(get_db)):
     data = body_dict(body)
     soft, error = client_software_or_fail(db, data)
@@ -974,9 +1397,12 @@ def client_cloud_vars(body: AnyBody, db: Session = Depends(get_db)):
     return ok([cloud_var_dict(row) for row in rows])
 
 
-@app.post("/api/client/user/register")
+@app.post("/api/client/user/register", deprecated=True)
 def client_user_register(body: AnyBody, request: Request, db: Session = Depends(get_db)):
     data = body_dict(body)
+    ip = request_ip(request) or "unknown"
+    if not rate_limiter.allow(f"client-register:{ip}", 20, 3600):
+        return fail("请求过于频繁", status_code=429, error_code="RATE_LIMITED", retryable=True)
     soft, error = client_software_or_fail(db, data)
     if not soft:
         return fail(error)
@@ -997,15 +1423,20 @@ def client_user_register(body: AnyBody, request: Request, db: Session = Depends(
     return ok(customer_dict(customer))
 
 
-@app.post("/api/client/user/login")
+@app.post("/api/client/user/login", deprecated=True)
 def client_user_login(body: AnyBody, request: Request, db: Session = Depends(get_db)):
     data = body_dict(body)
+    ip = request_ip(request) or "unknown"
+    if not rate_limiter.allow(f"client-login:{ip}", 60, 60):
+        return fail("请求过于频繁", status_code=429, error_code="RATE_LIMITED", retryable=True)
     soft, error = client_software_or_fail(db, data)
     if not soft:
         return fail(error)
     owner_id = soft.owner_id if soft else None
     customer = db.query(Customer).filter(Customer.owner_id == owner_id, Customer.email == data.get("email")).first() if owner_id else None
     if not customer or not verify_password(data.get("password") or "", customer.password_hash):
+        add_event(db, owner_id, "security", "userLogin", "软件用户登录失败", request, result="failed", software_id=data.get("softwareId"))
+        db.commit()
         return fail("邮箱或密码错误")
     customer.last_login = datetime.utcnow()
     add_event(db, owner_id, "api", "userLogin", "用户登录", request, software_id=data.get("softwareId"), customer_id=customer.customer_id)
@@ -1013,7 +1444,7 @@ def client_user_login(body: AnyBody, request: Request, db: Session = Depends(get
     return ok(customer_dict(customer))
 
 
-@app.post("/api/client/user/heartbeat")
+@app.post("/api/client/user/heartbeat", deprecated=True)
 def client_user_heartbeat(body: AnyBody, request: Request, db: Session = Depends(get_db)):
     data = body_dict(body)
     soft, error = client_software_or_fail(db, data)
@@ -1025,7 +1456,7 @@ def client_user_heartbeat(body: AnyBody, request: Request, db: Session = Depends
     return ok({"serverTime": datetime.utcnow().isoformat()})
 
 
-@app.post("/api/client/user/logout")
+@app.post("/api/client/user/logout", deprecated=True)
 def client_user_logout(body: AnyBody, request: Request, db: Session = Depends(get_db)):
     data = body_dict(body)
     soft, error = client_software_or_fail(db, data)

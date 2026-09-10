@@ -21,6 +21,7 @@
           <el-option label="已激活" value="active" />
           <el-option label="已过期" value="expired" />
           <el-option label="已禁用" value="disabled" />
+          <el-option label="已撤销" value="revoked" />
         </el-select>
         <el-button type="primary" :icon="Search" @click="search">搜索</el-button>
         <el-button :icon="Refresh" @click="resetSearch">重置</el-button>
@@ -76,6 +77,7 @@
                   <el-dropdown-menu>
                     <el-dropdown-item v-if="canUnbindAuth" command="remark" :icon="EditPen">修改备注</el-dropdown-item>
                     <el-dropdown-item v-if="canUnbindAuth" command="bind" :icon="Unlock">解绑/换绑</el-dropdown-item>
+                    <el-dropdown-item v-if="canUnbindAuth && row.state !== 'revoked'" command="revoke" :icon="Delete" divided>撤销卡密</el-dropdown-item>
                     <el-dropdown-item v-if="canDeleteAuth" command="delete" :icon="Delete" divided class="danger-dropdown-item">删除卡密</el-dropdown-item>
                   </el-dropdown-menu>
                 </template>
@@ -118,6 +120,7 @@
             <el-button size="small" :icon="CopyDocument" @click="copy(row.authId)">复制</el-button>
             <el-button v-if="canUnbindAuth" size="small" :icon="EditPen" @click="openRemark(row)">备注</el-button>
             <el-button v-if="canUnbindAuth" size="small" :icon="Unlock" @click="openBind(row)">解绑</el-button>
+            <el-button v-if="canUnbindAuth && row.state !== 'revoked'" size="small" type="warning" @click="revoke(row)">撤销</el-button>
             <el-button v-if="canDeleteAuth" size="small" type="danger" :icon="Delete" @click="remove(row)">删除</el-button>
           </div>
         </article>
@@ -306,6 +309,7 @@ function statusText(row) {
   if (row.state === 'active') return '已激活'
   if (row.state === 'expired') return '已过期'
   if (row.state === 'disabled') return '已禁用'
+  if (row.state === 'revoked') return '已撤销'
   return '未激活'
 }
 
@@ -313,6 +317,7 @@ function statusTag(row) {
   if (row.state === 'active') return 'success'
   if (row.state === 'expired') return 'info'
   if (row.state === 'disabled') return 'danger'
+  if (row.state === 'revoked') return 'danger'
   return 'primary'
 }
 
@@ -426,7 +431,14 @@ function openRemark(row) {
 function handleRowAction(command, row) {
   if (command === 'remark') openRemark(row)
   if (command === 'bind') openBind(row)
+  if (command === 'revoke') revoke(row)
   if (command === 'delete') remove(row)
+}
+
+async function revoke(row) {
+  await ElMessageBox.confirm(`撤销后卡密 ${row.authId} 将立即失效，确定继续？`, '撤销卡密', { type: 'warning' })
+  const res = await api.revokeAuth({ authId: row.authId })
+  if (res.success) load()
 }
 
 function isSelected(row) {

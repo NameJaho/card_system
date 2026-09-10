@@ -1,8 +1,8 @@
 <template>
   <div>
     <div class="panel">
-      <h3>软件侧 API 接入测试</h3>
-      <p class="muted">这里用于模拟软件客户端调用更新检查、卡密激活/验证、云变量和软件侧用户登录。</p>
+      <h3>v1 授权接入测试</h3>
+      <p class="muted">使用单一幂等 validate 接口；不会隐式换绑，也不需要桌面端保存实例密钥。</p>
       <el-form label-position="top">
         <div class="form-grid">
           <el-form-item label="实例">
@@ -11,21 +11,12 @@
             </el-select>
           </el-form-item>
           <el-form-item label="卡密"><el-input v-model="form.authId" placeholder="从网络验证页面复制卡密" /></el-form-item>
-          <el-form-item label="设备码"><el-input v-model="form.macid" /></el-form-item>
-          <el-form-item label="邮箱"><el-input v-model="form.email" /></el-form-item>
-          <el-form-item label="密码"><el-input v-model="form.password" type="password" /></el-form-item>
+          <el-form-item label="安装 ID"><el-input v-model="form.installationId" /></el-form-item>
+          <el-form-item label="客户端版本"><el-input v-model="form.clientVersion" /></el-form-item>
         </div>
       </el-form>
       <div class="toolbar">
-        <el-button type="primary" @click="call('update')">检查更新</el-button>
-        <el-button @click="call('activate')">激活卡密</el-button>
-        <el-button @click="call('verify')">验证卡密</el-button>
-        <el-button @click="call('unbind')">解绑卡密</el-button>
-        <el-button @click="call('vars')">读取云变量</el-button>
-        <el-button @click="call('register')">软件用户注册</el-button>
-        <el-button @click="call('login')">软件用户登录</el-button>
-        <el-button @click="call('heartbeat')">用户心跳</el-button>
-        <el-button @click="call('logout')">用户退出</el-button>
+        <el-button type="primary" @click="validateLicense">激活 / 验证授权</el-button>
       </div>
     </div>
     <div class="panel">
@@ -41,28 +32,23 @@ import { api } from '../services/api'
 
 const software = ref([])
 const output = ref('')
-const form = reactive({ softwareId: '', authId: '', macid: 'DEMO-MACHINE-1', email: 'client@example.com', password: 'client123456', customerId: '' })
+const form = reactive({ softwareId: '', authId: '', installationId: 'INST-DEMO-MACHINE-1', clientVersion: '1.0.0' })
 
 async function load() {
   const res = await api.softwareSelect()
   if (res.success) {
     software.value = res.data
     form.softwareId = software.value[0]?.softwareId || ''
+    form.clientVersion = software.value[0]?.version || '1.0.0'
   }
 }
-async function call(type) {
-  const payload = { ...form }
-  let res
-  if (type === 'update') res = await api.clientUpdate(payload)
-  if (type === 'activate') res = await api.clientActivate(payload)
-  if (type === 'verify') res = await api.clientVerify(payload)
-  if (type === 'unbind') res = await api.clientUnbind(payload)
-  if (type === 'vars') res = await api.clientVars(payload)
-  if (type === 'register') res = await api.clientRegister({ ...payload, nickName: '客户端用户' })
-  if (type === 'login') res = await api.clientLogin(payload)
-  if (type === 'heartbeat') res = await api.clientHeartbeat(payload)
-  if (type === 'logout') res = await api.clientLogout(payload)
-  if (res?.success && res.data?.customerId) form.customerId = res.data.customerId
+async function validateLicense() {
+  const res = await api.clientValidate({
+    softwareId: form.softwareId,
+    licenseKey: form.authId,
+    installationId: form.installationId,
+    clientVersion: form.clientVersion
+  })
   output.value = JSON.stringify(res, null, 2)
 }
 onMounted(load)

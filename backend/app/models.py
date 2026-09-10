@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -14,6 +14,7 @@ class AuthStatus(str, Enum):
     active = "active"
     expired = "expired"
     disabled = "disabled"
+    revoked = "revoked"
 
 
 class AdminUser(Base):
@@ -34,6 +35,7 @@ class AdminUser(Base):
     software_ids: Mapped[str] = mapped_column(Text, default='["*"]')
     is_agent: Mapped[bool] = mapped_column(Boolean, default=False)
     last_login: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    token_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     parent: Mapped[AdminUser | None] = relationship(remote_side=[id])
@@ -48,12 +50,15 @@ class SoftwareInstance(Base):
     version: Mapped[str] = mapped_column(String(80), default="1.0.0")
     low_version: Mapped[str | None] = mapped_column(String(80), nullable=True)
     software_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
-    instance_key: Mapped[str] = mapped_column(String(80), default="", index=True)
+    instance_key: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    protocol_version: Mapped[str] = mapped_column(String(20), default="v1", nullable=False)
+    strict_client_auth: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     force: Mapped[bool] = mapped_column(Boolean, default=False)
     remark: Mapped[str] = mapped_column(Text, default="")
     url: Mapped[str | None] = mapped_column(Text, nullable=True)
     notice: Mapped[str] = mapped_column(Text, default="")
     md5: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     visit: Mapped[int] = mapped_column(Integer, default=0)
     gitcode_project_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     gitcode_token: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -65,6 +70,11 @@ class SoftwareInstance(Base):
 
     owner: Mapped[AdminUser] = relationship()
 
+    __table_args__ = (
+        CheckConstraint("length(trim(instance_key)) > 0", name="ck_software_instance_key_not_blank"),
+        UniqueConstraint("instance_key", name="uq_software_instance_key"),
+    )
+
 
 class AuthCard(Base):
     __tablename__ = "auth_cards"
@@ -73,7 +83,6 @@ class AuthCard(Base):
     owner_id: Mapped[int] = mapped_column(ForeignKey("admin_users.id"), index=True)
     software_id: Mapped[str] = mapped_column(String(80), index=True)
     auth_id: Mapped[str] = mapped_column(String(120), unique=True, index=True)
-    private_key: Mapped[str] = mapped_column(String(80), index=True)
     status: Mapped[str] = mapped_column(String(20), default=AuthStatus.unused.value)
     macid: Mapped[str | None] = mapped_column(String(255), nullable=True)
     bind_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -157,3 +166,17 @@ class Message(Base):
     owner_id: Mapped[int] = mapped_column(ForeignKey("admin_users.id"), index=True)
     content: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class PasswordResetToken(Base):
+    __tablename__ = "password_reset_tokens"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("admin_users.id"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    requested_ip: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    user: Mapped[AdminUser] = relationship()
