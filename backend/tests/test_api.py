@@ -1,5 +1,6 @@
 import json
 import io
+import hashlib
 import os
 import sys
 import tempfile
@@ -7,10 +8,15 @@ import urllib.error
 import zipfile
 from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+import sqlalchemy as sa
+from alembic import command
+from alembic.config import Config
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 
 os.environ["CARD_DATABASE_URL"] = f"sqlite:///{tempfile.gettempdir()}/keydesk_api_test.db"
@@ -23,11 +29,33 @@ if str(ROOT_DIR) not in sys.path:
 from app.database import Base, SessionLocal, engine
 from app.config import get_settings, validate_production_settings
 from app.main import app
-from app.models import AuthCard, PasswordResetToken
+from app.license_protocol import b64url_encode, canonical_device_message, license_lookup_value, signing_material
+from app.models import AuthCard, LicenseAuditEvent, LicenseRequestNonce, PasswordResetToken
+from app.utils import rate_limiter
+
+
+def signed_v2_payload(software_id: str, license_key: str, installation_id: str, client_version: str, *, key=None, nonce=None, request_time=None):
+    key = key or Ed25519PrivateKey.generate()
+    public_key = b64url_encode(key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw))
+    nonce = nonce or b64url_encode(os.urandom(32))
+    request_time = request_time or datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    message = canonical_device_message(software_id, license_key, installation_id, client_version, public_key, nonce, request_time)
+    return {
+        "protocolVersion": 2,
+        "softwareId": software_id,
+        "licenseKey": license_key,
+        "installationId": installation_id,
+        "clientVersion": client_version,
+        "devicePublicKey": public_key,
+        "requestNonce": nonce,
+        "requestTime": request_time,
+        "deviceSignature": b64url_encode(key.sign(message)),
+    }, key
 
 
 @pytest.fixture(autouse=True)
 def clean_database():
+    rate_limiter.clear()
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
     with SessionLocal() as db:
@@ -94,7 +122,7 @@ def test_admin_and_client_auth_flow():
         assert wrong_key["success"] is False
         assert wrong_key["message"] == "实例密钥错误"
 
-        events = client.post("/api/adm/message/event", json={"page": {"pageNum": 1, "limit": 10}, "keyword": "verify"}, headers=headers).json()
+        events = client.post("/api/adm/message/event", json={"page": {"pageNum": 1, "limit": 10}, "keyword": "licenseValidate"}, headers=headers).json()
         assert events["success"] is True
         assert events["data"]["list"]
 
@@ -130,6 +158,8 @@ def test_admin_page_interfaces_and_auth_search_filters():
         assert created["success"] is True
         active_auth_id = created["data"][0]["authId"]
         unused_auth_id = created["data"][1]["authId"]
+        active_card_ref = created["data"][0]["cardRef"]
+        unused_card_ref = created["data"][1]["cardRef"]
 
         verify = client.post(
             "/api/client/v1/license/validate",
@@ -146,6 +176,7 @@ def test_admin_page_interfaces_and_auth_search_filters():
             ("/api/adm/cloudVariablesList", {}),
             ("/api/adm/blackWhiteList", {}),
             ("/api/adm/message/event", {"page": {"pageNum": 1, "limit": 10}}),
+            ("/api/adm/licenseAuditList", {"page": {"pageNum": 1, "limit": 10}}),
             ("/api/adm/message/list", {}),
             ("/api/adm/subUserList", {"page": {"pageNum": 1, "limit": 10}}),
         ]
@@ -160,8 +191,8 @@ def test_admin_page_interfaces_and_auth_search_filters():
             headers=headers,
         ).json()
         assert by_software["success"] is True
-        listed_ids = {row["authId"] for row in by_software["data"]["list"]}
-        assert {active_auth_id, unused_auth_id}.issubset(listed_ids)
+        listed_ids = {row["cardRef"] for row in by_software["data"]["list"]}
+        assert {created["data"][0]["cardRef"], created["data"][1]["cardRef"]}.issubset(listed_ids)
 
         by_status = client.post(
             "/api/adm/authList",
@@ -169,7 +200,7 @@ def test_admin_page_interfaces_and_auth_search_filters():
             headers=headers,
         ).json()
         assert by_status["success"] is True
-        assert active_auth_id in {row["authId"] for row in by_status["data"]["list"]}
+        assert created["data"][0]["cardRef"] in {row["cardRef"] for row in by_status["data"]["list"]}
         assert all(row["state"] == "active" for row in by_status["data"]["list"])
 
         by_keyword = client.post(
@@ -178,7 +209,7 @@ def test_admin_page_interfaces_and_auth_search_filters():
             headers=headers,
         ).json()
         assert by_keyword["success"] is True
-        assert [row["authId"] for row in by_keyword["data"]["list"]] == [active_auth_id]
+        assert [row["cardRef"] for row in by_keyword["data"]["list"]] == [active_card_ref]
 
         by_auth = client.post(
             "/api/adm/authList",
@@ -186,7 +217,7 @@ def test_admin_page_interfaces_and_auth_search_filters():
             headers=headers,
         ).json()
         assert by_auth["success"] is True
-        assert [row["authId"] for row in by_auth["data"]["list"]] == [unused_auth_id]
+        assert [row["cardRef"] for row in by_auth["data"]["list"]] == [unused_card_ref]
 
         exported = client.post(
             "/api/adm/exportTable",
@@ -194,7 +225,8 @@ def test_admin_page_interfaces_and_auth_search_filters():
             headers=headers,
         )
         assert exported.status_code == 200
-        assert active_auth_id in exported.text
+        assert active_card_ref in exported.text
+        assert active_auth_id not in exported.text
         assert unused_auth_id not in exported.text
 
 
@@ -528,7 +560,7 @@ def test_fixed_role_model_for_admin_and_user_login():
             ),
             "/api/adm/authList manager sees user card",
         )
-        assert [row["authId"] for row in manager_auth_list["data"]["list"]] == [user_auth["data"][0]["authId"]]
+        assert [row["cardRef"] for row in manager_auth_list["data"]["list"]] == [user_auth["data"][0]["cardRef"]]
         assert manager_auth_list["data"]["list"][0]["creatorUser"] == "role_user"
         hidden_admin_auth = assert_ok(
             client.post(
@@ -624,6 +656,8 @@ def test_sub_user_permissions_limit_access():
         assert denied_assign.status_code == 403
         denied_events = client.post("/api/adm/message/event", json={"page": {"pageNum": 1, "limit": 10}}, headers=sub_headers)
         assert denied_events.status_code == 403
+        denied_license_audits = client.post("/api/adm/licenseAuditList", json={"page": {"pageNum": 1, "limit": 10}}, headers=sub_headers)
+        assert denied_license_audits.status_code == 403
         denied_messages = client.post("/api/adm/message/list", json={}, headers=sub_headers)
         assert denied_messages.status_code == 403
         denied_send = client.post("/api/adm/message/send", json={"content": "blocked"}, headers=sub_headers)
@@ -667,11 +701,12 @@ def test_python_sdk_config_file_and_state_helpers(tmp_path):
     config_path.write_text(
         json.dumps(
             {
-                "baseUrl": "http://127.0.0.1:8080",
+                "baseUrl": "https://card.example.com",
                 "softwareId": "SWSDK",
                 "version": "2.0.0",
                 "licenseFile": "state/license.json",
                 "deviceFile": "state/device.txt",
+                "trustedPublicKeys": {signing_material().kid: signing_material().public_key_b64},
             },
             ensure_ascii=False,
         ),
@@ -681,10 +716,11 @@ def test_python_sdk_config_file_and_state_helpers(tmp_path):
     class FakeClient:
         def __init__(self):
             self.calls = []
+            self.trusted_public_keys = {"test": "key"}
 
-        def validate_license(self, software_id, auth_id, macid, version):
+        def validate_license(self, software_id, auth_id, macid, version, device_identity):
             self.calls.append(("validate_license", software_id, auth_id, macid, version))
-            return {"data": {"status": "active", "expiresAt": None, "serverTime": "2026-06-07T00:00:00Z"}}
+            return {"data": {"status": "active", "expiresAt": None, "serverTime": "2026-06-07T00:00:00Z", "leaseToken": "verified-by-fake"}}
 
     app = KeyDeskApp.from_file(config_path)
     fake = FakeClient()
@@ -692,13 +728,12 @@ def test_python_sdk_config_file_and_state_helpers(tmp_path):
 
     assert app.config.project_name == "KeyDesk App"
     assert app.config.software_id == "SWSDK"
-    assert app.config.instance_key == ""
     assert app.macid.startswith("INST-")
 
     card = app.verify("KMSDK")
     assert card["status"] == "active"
     assert app.saved_auth_id() == "KMSDK"
-    assert json.loads((tmp_path / "state/license.json").read_text(encoding="utf-8"))["licenseKey"] == "KMSDK"
+    assert app._state()["licenseKey"] == "KMSDK"
     assert ("validate_license", "SWSDK", "KMSDK", app.macid, "2.0.0") in fake.calls
 
     with pytest.raises(KeyDeskConfigError):
@@ -717,18 +752,20 @@ def test_python_sdk_only_retries_retryable_errors(tmp_path, monkeypatch):
             "deviceFile": str(tmp_path / "device"),
             "licenseFile": str(tmp_path / "license.json"),
             "maxRetries": 2,
+            "trustedPublicKeys": {signing_material().kid: signing_material().public_key_b64},
         }
     )
 
     class RetryClient:
         def __init__(self):
             self.calls = 0
+            self.trusted_public_keys = {"test": "key"}
 
         def validate_license(self, *args):
             self.calls += 1
             if self.calls < 3:
                 raise KeyDeskNetworkError("timeout", error_code="NETWORK_ERROR", retryable=True)
-            return {"data": {"status": "active", "serverTime": "2026-09-10T00:00:00Z"}}
+            return {"data": {"status": "active", "serverTime": "2026-09-10T00:00:00Z", "leaseToken": "verified-by-fake"}}
 
     retry_client = RetryClient()
     app.client = retry_client
@@ -739,6 +776,7 @@ def test_python_sdk_only_retries_retryable_errors(tmp_path, monkeypatch):
     class RevokedClient:
         def __init__(self):
             self.calls = 0
+            self.trusted_public_keys = {"test": "key"}
 
         def validate_license(self, *args):
             self.calls += 1
@@ -856,12 +894,12 @@ def test_strict_legacy_auth_and_v1_license_state_machine():
         assert mismatch.status_code == 409
         assert mismatch.json()["error"]["code"] == "LICENSE_DEVICE_MISMATCH"
         with SessionLocal() as db:
-            row = db.query(AuthCard).filter(AuthCard.auth_id == cards[0]["authId"]).one()
+            row = db.query(AuthCard).filter(AuthCard.license_lookup == license_lookup_value(cards[0]["authId"])).one()
             assert row.macid == "INST-A"
             assert row.bind_used == 0
-            disabled = db.query(AuthCard).filter(AuthCard.auth_id == cards[1]["authId"]).one()
+            disabled = db.query(AuthCard).filter(AuthCard.license_lookup == license_lookup_value(cards[1]["authId"])).one()
             disabled.status = "disabled"
-            expired = db.query(AuthCard).filter(AuthCard.auth_id == cards[2]["authId"]).one()
+            expired = db.query(AuthCard).filter(AuthCard.license_lookup == license_lookup_value(cards[2]["authId"])).one()
             expired.end_time = datetime.utcnow() - timedelta(seconds=1)
             db.commit()
 
@@ -913,6 +951,194 @@ def test_strict_legacy_auth_and_v1_license_state_machine():
         assert missing_installation.json()["error"]["code"] == "INVALID_REQUEST"
 
 
+def test_v2_device_proof_signed_lease_replay_and_hmac_storage():
+    from clients.python import KeyDeskClient, LicenseError
+
+    with TestClient(app) as client:
+        headers = login(client)
+        software = assert_ok(client.post("/api/adm/softwareSelect", json={}, headers=headers))["data"][0]
+        created = assert_ok(
+            client.post("/api/adm/createAuth", json={"softwareId": software["softwareId"], "createNumber": 1, "day": 1}, headers=headers)
+        )["data"][0]
+        license_key = created["authId"]
+        card_ref = created["cardRef"]
+        payload, device_key = signed_v2_payload(software["softwareId"], license_key, "INST-V2-DEVICE-A", software["version"])
+
+        response = client.post("/api/client/v2/license/validate", json=payload)
+        body = assert_ok(response)
+        assert body["data"]["status"] == "active"
+        assert body["data"]["requiresOnline"] is True
+        assert body["data"]["offlineGraceSeconds"] == 0
+        assert body["data"]["leaseToken"].count(".") == 2
+
+        verifier = KeyDeskClient(
+            "http://127.0.0.1:8080",
+            trusted_public_keys={signing_material().kid: signing_material().public_key_b64},
+        )
+        claims = verifier._verify_lease(
+            body,
+            software["softwareId"],
+            "INST-V2-DEVICE-A",
+            hashlib.sha256(device_key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)).hexdigest(),
+            software["version"],
+        )
+        assert claims["sub"] == card_ref
+        assert claims["protocolVersion"] == 2
+        assert "KM" not in claims["sub"]
+
+        replay = client.post("/api/client/v2/license/validate", json=payload)
+        assert replay.status_code == 409
+        assert replay.json()["error"]["code"] == "REQUEST_REPLAYED"
+        assert replay.json()["error"]["requestId"].startswith("req_")
+
+        tampered = dict(payload)
+        tampered["clientVersion"] = "1.0.1"
+        invalid_proof = client.post("/api/client/v2/license/validate", json=tampered)
+        assert invalid_proof.status_code == 401
+        assert invalid_proof.json()["error"]["code"] == "DEVICE_PROOF_INVALID"
+
+        expired_payload, _ = signed_v2_payload(
+            software["softwareId"],
+            license_key,
+            "INST-V2-DEVICE-A",
+            software["version"],
+            key=device_key,
+            request_time=(datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        )
+        expired_request = client.post("/api/client/v2/license/validate", json=expired_payload)
+        assert expired_request.status_code == 401
+        assert expired_request.json()["error"]["code"] == "REQUEST_EXPIRED"
+
+        cloned_payload, _ = signed_v2_payload(
+            software["softwareId"], license_key, "INST-V2-DEVICE-A", software["version"], key=Ed25519PrivateKey.generate()
+        )
+        clone = client.post("/api/client/v2/license/validate", json=cloned_payload)
+        assert clone.status_code == 409
+        assert clone.json()["error"]["code"] == "LICENSE_DEVICE_MISMATCH"
+
+        fresh_payload, _ = signed_v2_payload(
+            software["softwareId"], license_key, "INST-V2-DEVICE-A", software["version"], key=device_key
+        )
+        assert_ok(client.post("/api/client/v2/license/validate", json=fresh_payload))
+
+        invalid_shape = client.post("/api/client/v2/license/validate", json={**payload, "unexpected": True})
+        assert invalid_shape.status_code == 422
+        assert invalid_shape.json()["error"]["code"] == "INVALID_REQUEST"
+        assert invalid_shape.json()["error"]["requestId"].startswith("req_")
+
+        with SessionLocal() as db:
+            card = db.query(AuthCard).filter(AuthCard.license_lookup == license_lookup_value(license_key)).one()
+            assert card.auth_id == card_ref
+            assert card.auth_id != license_key
+            assert card.device_key_thumbprint == claims["deviceKeyThumbprint"]
+            assert card.protocol_version == 2
+            assert db.query(LicenseRequestNonce).count() >= 3
+            audit_text = json.dumps(
+                [
+                    {
+                        "licenseRef": event.license_ref,
+                        "last4": event.license_last4,
+                        "result": event.result_code,
+                    }
+                    for event in db.query(LicenseAuditEvent).all()
+                ]
+            )
+            assert license_key not in audit_text
+
+        listed_audits = assert_ok(
+            client.post(
+                "/api/adm/licenseAuditList",
+                json={"softwareId": software["softwareId"], "page": {"pageNum": 1, "limit": 50}},
+                headers=headers,
+            )
+        )["data"]["list"]
+        assert any(event["resultCode"] == "LICENSE_VALID" and event["licenseRef"] == card_ref for event in listed_audits)
+        assert license_key not in json.dumps(listed_audits)
+
+        listed = assert_ok(client.post("/api/adm/authList", json={"authId": license_key}, headers=headers))["data"]["list"]
+        assert listed[0]["cardRef"] == card_ref
+        assert license_key not in json.dumps(listed)
+
+        fake_success = {"success": True, "data": {"status": "active"}}
+        with pytest.raises(LicenseError, match="lease") as unsigned:
+            verifier._verify_lease(fake_success, software["softwareId"], "INST-V2-DEVICE-A", claims["deviceKeyThumbprint"], software["version"])
+        assert unsigned.value.error_code == "LEASE_SIGNATURE_INVALID"
+
+        forged = json.loads(json.dumps(body))
+        token = forged["data"]["leaseToken"]
+        forged["data"]["leaseToken"] = token[:-1] + ("A" if token[-1] != "A" else "B")
+        with pytest.raises(LicenseError) as bad_signature:
+            verifier._verify_lease(forged, software["softwareId"], "INST-V2-DEVICE-A", claims["deviceKeyThumbprint"], software["version"])
+        assert bad_signature.value.error_code == "LEASE_SIGNATURE_INVALID"
+
+
+def test_v2_protocol_cutover_and_client_update_gate():
+    with TestClient(app) as client:
+        headers = login(client)
+        software = assert_ok(client.post("/api/adm/softwareSelect", json={}, headers=headers))["data"][0]
+        updated = assert_ok(
+            client.post(
+                "/api/adm/updateSoftware",
+                json={
+                    "softwareId": software["softwareId"],
+                    "minimumProtocolVersion": 2,
+                    "version": "2.0.0",
+                    "lowVersion": "1.5.0",
+                    "leaseTtlSeconds": 300,
+                    "nextCheckAfterSeconds": 60,
+                },
+                headers=headers,
+            )
+        )["data"]
+        assert updated["minimumProtocolVersion"] == 2
+        assert updated["policyVersion"] == software["policyVersion"] + 1
+        card = assert_ok(client.post("/api/adm/createAuth", json={"softwareId": software["softwareId"], "createNumber": 1}, headers=headers))["data"][0]
+
+        v1 = client.post(
+            "/api/client/v1/license/validate",
+            json={"softwareId": software["softwareId"], "licenseKey": card["authId"], "installationId": "INST-CUTOVER-A", "clientVersion": "2.0.0"},
+        )
+        assert v1.status_code == 426
+        assert v1.json()["error"]["code"] == "PROTOCOL_UPGRADE_REQUIRED"
+
+        old_payload, _ = signed_v2_payload(software["softwareId"], card["authId"], "INST-CUTOVER-A", "1.0.0")
+        old = client.post("/api/client/v2/license/validate", json=old_payload)
+        assert old.status_code == 426
+        assert old.json()["error"]["code"] == "CLIENT_UPDATE_REQUIRED"
+        with SessionLocal() as db:
+            row = db.query(AuthCard).filter(AuthCard.license_lookup == license_lookup_value(card["authId"])).one()
+            assert row.status == "unused"
+            assert row.macid is None
+            assert row.device_key_thumbprint is None
+
+        current_payload, _ = signed_v2_payload(software["softwareId"], card["authId"], "INST-CUTOVER-A", "2.0.0")
+        assert_ok(client.post("/api/client/v2/license/validate", json=current_payload))
+
+
+def test_v2_concurrent_first_bind_has_one_device_winner():
+    with TestClient(app) as client:
+        headers = login(client)
+        software = assert_ok(client.post("/api/adm/softwareSelect", json={}, headers=headers))["data"][0]
+        card = assert_ok(client.post("/api/adm/createAuth", json={"softwareId": software["softwareId"], "createNumber": 1}, headers=headers))["data"][0]
+        requests = [
+            signed_v2_payload(software["softwareId"], card["authId"], f"INST-V2-CONCURRENT-{index}", software["version"])[0]
+            for index in range(100)
+        ]
+
+        def validate(payload):
+            return client.post("/api/client/v2/license/validate", json=payload)
+
+        with ThreadPoolExecutor(max_workers=20) as pool:
+            responses = list(pool.map(validate, requests))
+        successes = [response for response in responses if response.status_code == 200 and response.json().get("success")]
+        assert len(successes) == 1
+        assert all(
+            response.json().get("error", {}).get("code") in {"LICENSE_DEVICE_MISMATCH", "RATE_LIMITED"}
+            for response in responses
+            if response not in successes
+        )
+
+
 def test_admin_tenants_are_isolated_for_instances_and_cards():
     with TestClient(app) as client:
         developer_headers = login(client)
@@ -931,6 +1157,8 @@ def test_admin_tenants_are_isolated_for_instances_and_cards():
         b_card = assert_ok(
             client.post("/api/adm/createAuth", json={"softwareId": b_soft["softwareId"], "createNumber": 1}, headers=b_headers)
         )["data"][0]
+        b_payload, _ = signed_v2_payload(b_soft["softwareId"], b_card["authId"], "INST-TENANT-B", "1.0.0")
+        assert_ok(client.post("/api/client/v2/license/validate", json=b_payload))
 
         a_visible = assert_ok(client.post("/api/adm/softwareSelect", json={}, headers=a_headers))["data"]
         assert {row["softwareId"] for row in a_visible} == {a_soft["softwareId"]}
@@ -949,7 +1177,11 @@ def test_admin_tenants_are_isolated_for_instances_and_cards():
         )
         assert denied_card_create.status_code == 404
         a_cards = assert_ok(client.post("/api/adm/authList", json={}, headers=a_headers))["data"]["list"]
-        assert b_card["authId"] not in {row["authId"] for row in a_cards}
+        assert b_card["cardRef"] not in {row["cardRef"] for row in a_cards}
+        a_audits = assert_ok(client.post("/api/adm/licenseAuditList", json={}, headers=a_headers))["data"]["list"]
+        b_audits = assert_ok(client.post("/api/adm/licenseAuditList", json={}, headers=b_headers))["data"]["list"]
+        assert all(row["softwareId"] == a_soft["softwareId"] for row in a_audits)
+        assert any(row["softwareId"] == b_soft["softwareId"] and row["licenseRef"] == b_card["cardRef"] for row in b_audits)
 
 
 def test_password_reset_token_is_one_time_and_revokes_existing_sessions():
@@ -1014,8 +1246,9 @@ def test_concurrent_first_bind_has_one_winning_installation():
 def test_health_metadata_and_downloadable_minimal_sdk_package():
     with TestClient(app) as client:
         health = assert_ok(client.get("/health"))
-        assert health["data"]["schemaVersion"] == "20260910_01"
-        assert health["data"]["protocolVersion"] == "v1"
+        assert health["data"]["schemaVersion"] == "20260911_02"
+        assert health["data"]["protocolVersions"] == [1, 2]
+        assert health["data"]["activeSigningKid"] == signing_material().kid
         assert "secret" not in json.dumps(health).lower()
 
         headers = login(client)
@@ -1033,7 +1266,7 @@ def test_health_metadata_and_downloadable_minimal_sdk_package():
             assert software["instanceKey"] not in archive.read("keydesk.json").decode()
 
 
-def test_production_rejects_default_secrets():
+def test_production_rejects_default_secrets(tmp_path):
     insecure = replace(
         get_settings(),
         environment="production",
@@ -1052,5 +1285,113 @@ def test_production_rejects_default_secrets():
         default_admin_password="unique-admin-password",
         database_url="mysql+pymysql://card_user:unique-db-password@mysql/card_system",
         allow_dev_reset_link=False,
+        license_signing_key_file=str(tmp_path / "license-signing.pem"),
+        license_signing_key_id="license-test-01",
+        license_pepper="a-unique-production-license-pepper-value",
+    )
+    private_key = Ed25519PrivateKey.generate()
+    (tmp_path / "license-signing.pem").write_bytes(
+        private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
     )
     validate_production_settings(secure)
+
+
+def test_v2_migration_fresh_legacy_and_partial_state(tmp_path):
+    original_database_url = os.environ["CARD_DATABASE_URL"]
+    original_pepper = os.environ.get("CARD_LICENSE_PEPPER")
+    migrations_dir = ROOT_DIR / "backend" / "migrations"
+
+    def upgrade(database_path: Path) -> None:
+        os.environ["CARD_DATABASE_URL"] = f"sqlite:///{database_path.as_posix()}"
+        os.environ["CARD_LICENSE_PEPPER"] = "migration-test-pepper-that-is-long-enough"
+        get_settings.cache_clear()
+        config = Config(str(ROOT_DIR / "backend" / "alembic.ini"))
+        config.set_main_option("script_location", str(migrations_dir))
+        command.upgrade(config, "head")
+
+    def legacy_database(database_path: Path, auth_id: str) -> sa.Engine:
+        legacy_engine = sa.create_engine(f"sqlite:///{database_path.as_posix()}")
+        metadata = sa.MetaData()
+        sa.Table("admin_users", metadata, sa.Column("id", sa.Integer(), primary_key=True))
+        sa.Table("software_instances", metadata, sa.Column("id", sa.Integer(), primary_key=True))
+        auth_cards = sa.Table(
+            "auth_cards",
+            metadata,
+            sa.Column("id", sa.Integer(), primary_key=True),
+            sa.Column("auth_id", sa.String(120), nullable=False, unique=True),
+        )
+        event_logs = sa.Table(
+            "event_logs",
+            metadata,
+            sa.Column("id", sa.Integer(), primary_key=True),
+            sa.Column("auth_id", sa.String(120), nullable=True),
+        )
+        versions = sa.Table("alembic_version", metadata, sa.Column("version_num", sa.String(32), primary_key=True))
+        metadata.create_all(legacy_engine)
+        with legacy_engine.begin() as connection:
+            connection.execute(auth_cards.insert().values(id=1, auth_id=auth_id))
+            connection.execute(event_logs.insert(), [{"id": 1, "auth_id": auth_id}, {"id": 2, "auth_id": "KMORPHAN1234"}])
+            connection.execute(versions.insert().values(version_num="20260910_01"))
+        return legacy_engine
+
+    try:
+        fresh_path = tmp_path / "fresh.db"
+        upgrade(fresh_path)
+        fresh_engine = sa.create_engine(f"sqlite:///{fresh_path.as_posix()}")
+        assert sa.inspect(fresh_engine).has_table("license_request_nonces")
+        with fresh_engine.connect() as connection:
+            assert connection.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one() == "20260911_02"
+
+        raw_license = "KMLEGACY1234567890"
+        legacy_path = tmp_path / "legacy.db"
+        legacy_engine = legacy_database(legacy_path, raw_license)
+        legacy_engine.dispose()
+        upgrade(legacy_path)
+        upgrade(legacy_path)
+        migrated_engine = sa.create_engine(f"sqlite:///{legacy_path.as_posix()}")
+        with migrated_engine.connect() as connection:
+            card = connection.execute(sa.text("SELECT auth_id, license_lookup, license_last4 FROM auth_cards")).mappings().one()
+            events = connection.execute(sa.text("SELECT id, auth_id FROM event_logs ORDER BY id")).mappings().all()
+            assert card["auth_id"].startswith("CARD_")
+            assert card["license_lookup"] == license_lookup_value(raw_license, "migration-test-pepper-that-is-long-enough")
+            assert card["license_last4"] == "7890"
+            assert events[0]["auth_id"] == card["auth_id"]
+            assert events[1]["auth_id"].startswith("hmac:")
+            assert raw_license not in json.dumps([dict(card), *(dict(event) for event in events)])
+
+        partial_path = tmp_path / "partial.db"
+        partial_engine = legacy_database(partial_path, "CARD_PARTIAL_WITHOUT_LOOKUP")
+        partial_engine.dispose()
+        with pytest.raises(RuntimeError, match="partially migrated"):
+            upgrade(partial_path)
+    finally:
+        os.environ["CARD_DATABASE_URL"] = original_database_url
+        if original_pepper is None:
+            os.environ.pop("CARD_LICENSE_PEPPER", None)
+        else:
+            os.environ["CARD_LICENSE_PEPPER"] = original_pepper
+        get_settings.cache_clear()
+
+
+def test_sdk_does_not_overwrite_corrupt_device_identity(tmp_path):
+    from clients.python import KeyDeskApp, KeyDeskConfigError
+
+    device_file = tmp_path / "device-v2.bin"
+    original = b"corrupt-device-identity"
+    device_file.write_bytes(original)
+    app_client = KeyDeskApp.from_dict(
+        {
+            "baseUrl": "https://card.example.com",
+            "softwareId": "SW-CORRUPT-DEVICE",
+            "version": "1.0.1",
+            "deviceFile": str(device_file),
+            "trustedPublicKeys": {signing_material().kid: signing_material().public_key_b64},
+        }
+    )
+    with pytest.raises(KeyDeskConfigError, match="设备身份文件损坏"):
+        _ = app_client.device_identity
+    assert device_file.read_bytes() == original

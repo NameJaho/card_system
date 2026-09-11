@@ -34,10 +34,17 @@ cp .env.example .env
 
 ```text
 CARD_HTTP_PORT=8080
+CARD_ENV=production
+CARD_PUBLIC_BASE_URL=https://card.example.com
+CARD_CORS_ORIGINS=https://card.example.com
 CARD_SECRET_KEY=替换为随机长字符串
 CARD_DEFAULT_ADMIN_USER=admin
 CARD_DEFAULT_ADMIN_PASSWORD=替换为强密码
 CARD_DEFAULT_ADMIN_EMAIL=admin@example.com
+CARD_LICENSE_SIGNING_KEY_FILE=/run/secrets/keydesk-license-ed25519.pem
+CARD_LICENSE_SIGNING_KEY_FILE_HOST=./secrets/keydesk-license-ed25519.pem
+CARD_LICENSE_SIGNING_KEY_ID=license-2026-01
+CARD_LICENSE_PEPPER=替换为生成后永久保持不变的至少32位高熵值
 
 PYTHON_IMAGE=python:3.12-slim
 NODE_IMAGE=node:22-alpine
@@ -53,13 +60,23 @@ TZ=Asia/Shanghai
 
 `MYSQL_DATA_DIR` 是 MySQL 的宿主机持久化目录。默认值 `./runtime/mysql` 表示数据保存在项目目录下，即使容器删除后，只要该目录不删除，数据仍然保留。
 
+启动前生成 Ed25519 签名私钥，并把 pepper 与数据库一起纳入安全灾备：
+
+```bash
+install -d -m 700 secrets
+openssl genpkey -algorithm Ed25519 -out secrets/keydesk-license-ed25519.pem
+chmod 600 secrets/keydesk-license-ed25519.pem
+```
+
+`CARD_LICENSE_PEPPER` 在首次迁移后不能更换或重新生成，否则所有卡密都会变成不可查询。生产 URL 必须使用 HTTPS；公网 TLS 由 OpenClaw 外层代理、Caddy、Traefik 或负载均衡器终止。
+
 ## 3. 启动服务
 
 ```bash
 docker compose up -d --build
 ```
 
-首次启动会自动拉取 MySQL 镜像、构建后端和前端镜像、创建数据库表、初始化超级管理员与演示数据。
+首次启动会自动拉取 MySQL 镜像、构建镜像，并按“安全配置预检 → Alembic 迁移 → API”启动后端。配置或签名私钥不安全时后端会拒绝启动。
 
 查看状态：
 
@@ -104,27 +121,27 @@ http://服务器IP:8080
 
 客户端接口和管理后台使用同一个域名，路径统一为 `/api/client/*`。完整说明见 [client-integration.md](client-integration.md)。
 
-最小验证命令：
+在后台实例页下载 `keydesk-<softwareId>-python-v2.zip`。解压后使用专用测试卡验证：
 
 ```bash
-python3 clients/python/keydesk_client.py \
-  --base-url http://服务器IP:8080 \
-  --software-id SWxxxxxxxxxxxx \
-  --auth-id KMxxxxxxxxxxxxxxxxxxxx \
-  --macid DEMO-MACHINE-1 \
-  verify
+pip install cryptography
+python smoke_test.py
 ```
+
+下载包已固化生产 HTTPS 地址与 Ed25519 公钥；不要允许客户端配置覆盖信任根。完整流程见 [client-integration.md](client-integration.md)。
 
 ## 6. 升级项目
 
-升级前先备份数据库。然后执行：
+升级前先备份并验证数据库可恢复。`20260911_02` 会移除历史明文卡密，不能靠 Alembic downgrade 回滚；不要只执行无检查的 `git pull && docker compose up`。按 [production-update.md](production-update.md) 完成 pepper、签名私钥、预检、显式迁移和烟雾测试。
+
+普通无结构变更版本才可使用：
 
 ```bash
 git pull
 docker compose up -d --build
 ```
 
-后端启动时会自动执行轻量表结构补齐，例如卡密创建者字段。不要手动删除 `runtime/mysql`，否则会清空全部业务数据。
+不要手动删除 `runtime/mysql`，否则会清空全部业务数据。
 
 ## 7. 备份与恢复
 
@@ -151,7 +168,7 @@ tar -czf runtime/mysql-backup.tgz runtime/mysql
 ## 8. 常见问题
 
 - 页面打不开：检查 `docker compose ps`，确认 `frontend` 处于 healthy/running，并确认服务器防火墙放行 `CARD_HTTP_PORT`。
-- 后端启动失败：查看 `docker compose logs -f backend`，重点检查 `CARD_DATABASE_URL`、MySQL 密码和 MySQL 健康状态。
+- 后端启动失败：查看 `docker compose logs -f backend`，重点检查生产配置预检、Ed25519 私钥、不可变 pepper、`CARD_DATABASE_URL`、MySQL 密码和健康状态。
 - 镜像拉取失败：通常是 Docker Hub 网络或镜像源问题。可以在 `.env` 中把 `PYTHON_IMAGE`、`NODE_IMAGE`、`NGINX_IMAGE`、`MYSQL_IMAGE` 改成 OpenClaw/服务器可访问镜像源里的等价镜像，然后重新执行 `docker compose up -d --build`。
 - 数据丢失：确认没有执行 `rm -rf runtime/mysql`，也没有把 `MYSQL_DATA_DIR` 改到另一个目录。
 - 端口冲突：修改 `.env` 里的 `CARD_HTTP_PORT`，再执行 `docker compose up -d`。

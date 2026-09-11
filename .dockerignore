@@ -5,7 +5,9 @@ backend/.pytest_cache
 frontend/node_modules
 frontend/dist
 runtime
+secrets
 .env
+*.pem
 *.log
 *.csv
 *.db

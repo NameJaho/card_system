@@ -6,7 +6,7 @@
           <el-input
             v-model="query.keyword"
             :prefix-icon="Search"
-            placeholder="搜索卡密 / 实例 / 设备 / 备注"
+            placeholder="搜索卡密尾号 / 实例 / 设备 / 备注"
             clearable
             @keyup.enter="search"
           />
@@ -14,7 +14,7 @@
         <el-select v-model="query.softwareId" placeholder="实例" clearable>
           <el-option v-for="item in software" :key="item.softwareId" :label="item.name" :value="item.softwareId" />
         </el-select>
-        <el-input v-model="query.authId" placeholder="卡密片段" clearable />
+        <el-input v-model="query.authId" placeholder="卡密尾号 / 记录引用" clearable />
         <el-input v-model="query.macid" placeholder="设备码" clearable />
         <el-select v-model="query.status" placeholder="状态" clearable>
           <el-option label="未激活" value="unused" />
@@ -35,10 +35,10 @@
 
       <el-table class="desktop-data-table" v-loading="loading" :data="rows" @selection-change="selected = $event">
         <el-table-column v-if="canDeleteAuth" type="selection" width="44" />
-        <el-table-column label="卡密" min-width="250">
+        <el-table-column label="卡密标识" min-width="250">
           <template #default="{ row }">
             <div class="card-code">
-              <strong>{{ row.authId }}</strong>
+              <strong>{{ displayLicense(row) }}</strong>
               <span>{{ row.createTime }}</span>
             </div>
           </template>
@@ -65,12 +65,9 @@
         </el-table-column>
         <el-table-column prop="endTime" label="到期时间" min-width="160" />
         <el-table-column prop="remark" label="备注" min-width="140" show-overflow-tooltip />
-        <el-table-column label="操作" width="108" fixed="right" class-name="auth-operation-column">
+        <el-table-column label="操作" width="72" fixed="right" class-name="auth-operation-column">
           <template #default="{ row }">
             <div class="auth-row-actions">
-              <el-tooltip content="复制卡密" placement="top">
-                <el-button size="small" :icon="CopyDocument" circle @click="copy(row.authId)" />
-              </el-tooltip>
               <el-dropdown v-if="canUnbindAuth || canDeleteAuth" trigger="click" placement="bottom-end" @command="(command) => handleRowAction(command, row)">
                 <el-button size="small" :icon="MoreFilled" circle />
                 <template #dropdown>
@@ -88,10 +85,10 @@
       </el-table>
 
       <div v-loading="loading" class="mobile-card-list auth-mobile-list">
-        <article v-for="row in rows" :key="row.authId" class="mobile-record-card auth-record-card">
+        <article v-for="row in rows" :key="cardReference(row)" class="mobile-record-card auth-record-card">
           <div class="mobile-record-head">
             <div class="card-code mobile-card-code">
-              <strong>{{ row.authId }}</strong>
+              <strong>{{ displayLicense(row) }}</strong>
               <span>{{ row.createTime }}</span>
             </div>
             <div class="mobile-record-status">
@@ -117,7 +114,6 @@
             </div>
           </div>
           <div class="mobile-record-actions">
-            <el-button size="small" :icon="CopyDocument" @click="copy(row.authId)">复制</el-button>
             <el-button v-if="canUnbindAuth" size="small" :icon="EditPen" @click="openRemark(row)">备注</el-button>
             <el-button v-if="canUnbindAuth" size="small" :icon="Unlock" @click="openBind(row)">解绑</el-button>
             <el-button v-if="canUnbindAuth && row.state !== 'revoked'" size="small" type="warning" @click="revoke(row)">撤销</el-button>
@@ -345,6 +341,14 @@ function creatorWarningText(row) {
   return `该卡密由${role} ${who} 创建。`
 }
 
+function cardReference(row) {
+  return row.cardRef || row.authId
+}
+
+function displayLicense(row) {
+  return row.licenseLast4 ? `KM••••${row.licenseLast4}` : '历史卡密（已隐藏）'
+}
+
 async function loadSoftware() {
   const res = await api.softwareSelect()
   if (res.success) {
@@ -412,11 +416,11 @@ function isPresetActive(item) {
 }
 
 function openBind(row) {
-  Object.assign(bindDialog, { visible: true, authId: row.authId, macid: row.macid || '', change: false })
+  Object.assign(bindDialog, { visible: true, authId: cardReference(row), macid: row.macid || '', change: false })
 }
 
 async function saveBind() {
-  const res = await api.unbindAuth({ authId: bindDialog.authId, macid: bindDialog.change ? bindDialog.macid : '' })
+  const res = await api.unbindAuth({ cardRef: bindDialog.authId, macid: bindDialog.change ? bindDialog.macid : '' })
   if (res.success) {
     ElMessage.success('修改成功')
     bindDialog.visible = false
@@ -425,7 +429,7 @@ async function saveBind() {
 }
 
 function openRemark(row) {
-  Object.assign(remarkDialog, { visible: true, authId: row.authId, remark: row.remark || '' })
+  Object.assign(remarkDialog, { visible: true, authId: cardReference(row), remark: row.remark || '' })
 }
 
 function handleRowAction(command, row) {
@@ -436,25 +440,25 @@ function handleRowAction(command, row) {
 }
 
 async function revoke(row) {
-  await ElMessageBox.confirm(`撤销后卡密 ${row.authId} 将立即失效，确定继续？`, '撤销卡密', { type: 'warning' })
-  const res = await api.revokeAuth({ authId: row.authId })
+  await ElMessageBox.confirm(`撤销后卡密 ${displayLicense(row)} 将立即失效，确定继续？`, '撤销卡密', { type: 'warning' })
+  const res = await api.revokeAuth({ cardRef: cardReference(row) })
   if (res.success) load()
 }
 
 function isSelected(row) {
-  return selected.value.some((item) => item.authId === row.authId)
+  return selected.value.some((item) => cardReference(item) === cardReference(row))
 }
 
 function toggleMobileSelect(row, checked) {
   if (checked && !isSelected(row)) {
     selected.value = [...selected.value, row]
   } else if (!checked) {
-    selected.value = selected.value.filter((item) => item.authId !== row.authId)
+    selected.value = selected.value.filter((item) => cardReference(item) !== cardReference(row))
   }
 }
 
 async function saveRemark() {
-  const res = await api.updateAuthRemark({ authId: remarkDialog.authId, remark: remarkDialog.remark })
+  const res = await api.updateAuthRemark({ cardRef: remarkDialog.authId, remark: remarkDialog.remark })
   if (res.success) {
     ElMessage.success('保存成功')
     remarkDialog.visible = false
@@ -463,8 +467,8 @@ async function saveRemark() {
 }
 
 async function remove(row) {
-  await ElMessageBox.confirm(`确定删除卡密 ${row.authId}？${showCreatorColumn.value ? `\n${creatorWarningText(row)}` : ''}`, row.creatorRole === 'user' ? '删除用户创建的卡密' : '确认删除', { type: 'warning' })
-  const res = await api.deleteAuth({ authId: row.authId })
+  await ElMessageBox.confirm(`确定删除卡密 ${displayLicense(row)}？${showCreatorColumn.value ? `\n${creatorWarningText(row)}` : ''}`, row.creatorRole === 'user' ? '删除用户创建的卡密' : '确认删除', { type: 'warning' })
+  const res = await api.deleteAuth({ cardRef: cardReference(row) })
   if (res.success) load()
 }
 
@@ -472,7 +476,7 @@ async function batchDelete() {
   const userCreated = selected.value.filter((row) => row.creatorRole === 'user').length
   const suffix = userCreated ? `，其中 ${userCreated} 个由普通用户创建` : ''
   await ElMessageBox.confirm(`确定删除选中的 ${selected.value.length} 个卡密${suffix}？`, userCreated ? '批量删除含用户卡密' : '确认删除', { type: 'warning' })
-  const res = await api.batchDeleteAuth({ list: selected.value.map((row) => row.authId) })
+  const res = await api.batchDeleteAuth({ list: selected.value.map(cardReference) })
   if (res.success) load()
 }
 

@@ -29,10 +29,13 @@ def fail(
     return JSONResponse(status_code=status_code, content=content)
 
 
-def api_error(code: str, message: str, status_code: int, retryable: bool = False) -> JSONResponse:
+def api_error(code: str, message: str, status_code: int, retryable: bool = False, request_id: str | None = None) -> JSONResponse:
+    error = {"code": code, "message": message, "retryable": retryable}
+    if request_id:
+        error["requestId"] = request_id
     return JSONResponse(
         status_code=status_code,
-        content={"success": False, "error": {"code": code, "message": message, "retryable": retryable}},
+        content={"success": False, "error": error},
     )
 
 
@@ -52,6 +55,10 @@ class SlidingWindowRateLimiter:
                 return False
             events.append(now)
             return True
+
+    def clear(self) -> None:
+        with self._lock:
+            self._events.clear()
 
 
 rate_limiter = SlidingWindowRateLimiter()

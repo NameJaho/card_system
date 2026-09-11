@@ -13,3 +13,5 @@ runtime/
 .keydesk-license.json
 keydesk-client.json
 coverage/
+secrets/
+*.pem

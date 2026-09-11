@@ -22,11 +22,36 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from packaging.version import InvalidVersion, Version
 from sqlalchemy import and_, or_, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .database import Base, SessionLocal, engine, get_db
 from .config import get_settings, validate_production_settings
-from .models import AdminUser, AuthCard, BlackWhiteItem, CloudVariable, Customer, EventLog, Message, PasswordResetToken, SoftwareInstance
+from .models import (
+    AdminUser,
+    AuthCard,
+    BlackWhiteItem,
+    CloudVariable,
+    Customer,
+    EventLog,
+    LicenseAuditEvent,
+    LicenseRequestNonce,
+    LicenseSigningKey,
+    Message,
+    PasswordResetToken,
+    SoftwareInstance,
+)
+from .license_protocol import (
+    b64url_decode,
+    canonical_device_message,
+    license_last4,
+    license_lookup_value,
+    new_request_id,
+    sign_jws,
+    signing_material,
+    trusted_public_keys,
+    verify_device_signature,
+)
 from .security import (
     create_token,
     current_user,
@@ -51,6 +76,7 @@ from .serializers import (
     cloud_var_dict,
     customer_dict,
     event_dict,
+    license_audit_dict,
     message_dict,
     software_dict,
     user_dict,
@@ -72,8 +98,21 @@ app.add_middleware(
 @app.on_event("startup")
 def startup() -> None:
     validate_production_settings(get_settings())
+    material = signing_material()
+    verification_keys = trusted_public_keys()
     Base.metadata.create_all(bind=engine)
     with SessionLocal() as db:
+        db.query(LicenseSigningKey).filter(LicenseSigningKey.kid.notin_(verification_keys)).update(
+            {"status": "retired"}, synchronize_session=False
+        )
+        for kid, public_key in verification_keys.items():
+            row = db.query(LicenseSigningKey).filter(LicenseSigningKey.kid == kid).first()
+            if not row:
+                row = LicenseSigningKey(kid=kid, public_key=public_key, status="active" if kid == material.kid else "verifying")
+                db.add(row)
+            else:
+                row.public_key = public_key
+                row.status = "active" if kid == material.kid else "verifying"
         seed_database(db)
 
 
@@ -102,10 +141,33 @@ class LicenseValidateBody(BaseModel):
         return value
 
 
+class LicenseValidateV2Body(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    protocolVersion: int
+    softwareId: str = Field(min_length=3, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+    licenseKey: str = Field(min_length=8, max_length=120, pattern=r"^[A-Za-z0-9_-]+$")
+    installationId: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
+    clientVersion: str = Field(min_length=1, max_length=80, pattern=r"^[0-9A-Za-z.+_-]+$")
+    devicePublicKey: str = Field(min_length=43, max_length=43, pattern=r"^[A-Za-z0-9_-]+$")
+    requestNonce: str = Field(min_length=32, max_length=86, pattern=r"^[A-Za-z0-9_-]+$")
+    requestTime: str = Field(min_length=20, max_length=32, pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$")
+    deviceSignature: str = Field(min_length=86, max_length=86, pattern=r"^[A-Za-z0-9_-]+$")
+
+    @field_validator("protocolVersion")
+    @classmethod
+    def require_v2(cls, value: int) -> int:
+        if value != 2:
+            raise ValueError("protocolVersion must be 2")
+        return value
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     if request.url.path.startswith("/api/client/v1/"):
         return api_error("INVALID_REQUEST", "请求字段缺失或格式错误", 422)
+    if request.url.path.startswith("/api/client/v2/"):
+        return api_error("INVALID_REQUEST", "请求字段缺失或格式错误", 422, request_id=new_request_id())
     return await request_validation_exception_handler(request, exc)
 
 
@@ -220,6 +282,20 @@ def visible_auth_query(db: Session, user: AdminUser):
     return q
 
 
+def auth_reference_filter(value: Any):
+    raw = text_value(value)
+    if raw.startswith("CARD_"):
+        return AuthCard.auth_id == raw
+    return AuthCard.license_lookup == license_lookup_value(raw)
+
+
+def visible_auth_card(db: Session, user: AdminUser, value: Any) -> AuthCard | None:
+    raw = text_value(value)
+    if not raw:
+        return None
+    return visible_auth_query(db, user).filter(auth_reference_filter(raw)).first()
+
+
 def get_software_or_404(db: Session, user: AdminUser, software_id: str) -> SoftwareInstance:
     row = visible_software_query(db, user).filter(SoftwareInstance.software_id == software_id).first()
     if not row:
@@ -282,7 +358,12 @@ def apply_auth_filters(query, data: dict[str, Any]):
     if software_id:
         query = query.filter(AuthCard.software_id == software_id)
     if auth_id:
-        query = query.filter(AuthCard.auth_id.contains(auth_id))
+        if auth_id.startswith("CARD_"):
+            query = query.filter(AuthCard.auth_id.contains(auth_id))
+        elif len(auth_id) >= 8:
+            query = query.filter(or_(AuthCard.license_lookup == license_lookup_value(auth_id), AuthCard.license_last4.contains(auth_id[-4:].upper())))
+        else:
+            query = query.filter(AuthCard.license_last4.contains(auth_id.upper()))
     if macid:
         query = query.filter(AuthCard.macid.contains(macid))
     if keyword:
@@ -290,6 +371,7 @@ def apply_auth_filters(query, data: dict[str, Any]):
         query = query.filter(
             or_(
                 AuthCard.auth_id.like(like),
+                AuthCard.license_last4.like(like),
                 AuthCard.software_id.like(like),
                 AuthCard.macid.like(like),
                 AuthCard.remark.like(like),
@@ -320,8 +402,9 @@ def health(db: Session = Depends(get_db)):
             "appVersion": settings.app_version,
             "gitSha": settings.git_sha,
             "schemaVersion": schema_version,
-            "protocolVersion": "v1",
-            "sdkVersion": "1.0.0",
+            "protocolVersions": [1, 2],
+            "activeSigningKid": signing_material().kid,
+            "sdkVersion": "2.0.0",
         }
     )
 
@@ -519,7 +602,9 @@ def user_config(user: AdminUser = Depends(current_user)):
             "appVersion": settings.app_version,
             "gitSha": settings.git_sha,
             "schemaVersion": settings.schema_version,
-            "protocolVersion": "v1",
+            "protocolVersions": [1, 2],
+            "activeSigningKid": signing_material().kid,
+            "sdkVersion": "2.0.0",
         }
     )
 
@@ -574,6 +659,21 @@ def client_package(body: AnyBody, user: AdminUser = Depends(require_permission("
         "softwareId": software.software_id,
         "version": software.version,
     }
+    sdk_source = sdk_path.read_text(encoding="utf-8")
+    base_placeholder = 'BUILTIN_PRODUCTION_BASE_URL = ""'
+    keys_placeholder = "BUILTIN_TRUSTED_LICENSE_KEYS: dict[str, str] = {}"
+    if base_placeholder not in sdk_source or keys_placeholder not in sdk_source:
+        return fail("SDK 模板缺少生产信任根占位符", status_code=503, error_code="SDK_PACKAGE_INVALID")
+    sdk_source = sdk_source.replace(
+        base_placeholder,
+        f"BUILTIN_PRODUCTION_BASE_URL = {json.dumps(get_settings().public_base_url)}",
+        1,
+    )
+    sdk_source = sdk_source.replace(
+        keys_placeholder,
+        f"BUILTIN_TRUSTED_LICENSE_KEYS: dict[str, str] = {json.dumps(trusted_public_keys(), sort_keys=True)}",
+        1,
+    )
     example = (
         "from keydesk import KeyDesk, LicenseError\n\n"
         "license = KeyDesk.from_file('keydesk.json')\n"
@@ -591,13 +691,16 @@ def client_package(body: AnyBody, user: AdminUser = Depends(require_permission("
     )
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("keydesk.py", sdk_path.read_text(encoding="utf-8"))
+        archive.writestr("keydesk.py", sdk_source)
         archive.writestr("keydesk.json", json.dumps(config, ensure_ascii=False, indent=2) + "\n")
         archive.writestr("example.py", example)
         archive.writestr("smoke_test.py", smoke)
-        archive.writestr("README.txt", "运行 python example.py。首版 v1 必须在线验证；不要关闭 TLS 校验。\n")
+        archive.writestr(
+            "README.txt",
+            "先运行 pip install cryptography，再运行 python example.py。v2 必须在线验证签名 lease；不要修改内置服务地址、公钥或关闭 TLS 校验。\n",
+        )
     output.seek(0)
-    filename = f"keydesk-{software.software_id}-python-v1.zip"
+    filename = f"keydesk-{software.software_id}-python-v2.zip"
     return StreamingResponse(
         output,
         media_type="application/zip",
@@ -614,6 +717,14 @@ def create_software(body: AnyBody, db: Session = Depends(get_db), user: AdminUse
         return fail("请不要使用关键字符 |")
     if not valid_sha256(data.get("sha256")):
         return fail("SHA-256 必须是 64 位十六进制字符串")
+    try:
+        minimum_protocol = int(data.get("minimumProtocolVersion") or 1)
+        lease_ttl = int(data.get("leaseTtlSeconds") or get_settings().license_lease_ttl_seconds)
+        next_check = int(data.get("nextCheckAfterSeconds") or get_settings().license_next_check_seconds)
+    except (TypeError, ValueError):
+        return fail("协议策略必须是整数")
+    if minimum_protocol not in {1, 2} or not 30 <= lease_ttl <= 900 or not 10 <= next_check <= lease_ttl:
+        return fail("协议策略超出允许范围")
     row = SoftwareInstance(
         owner_id=owner_id_for(user),
         name=data["name"],
@@ -629,6 +740,11 @@ def create_software(body: AnyBody, db: Session = Depends(get_db), user: AdminUse
         sha256=data.get("sha256") or None,
         protocol_version="v1",
         strict_client_auth=True,
+        minimum_protocol_version=minimum_protocol,
+        lease_ttl_seconds=lease_ttl,
+        next_check_after_seconds=next_check,
+        offline_grace_seconds=0,
+        device_proof_required=True,
     )
     db.add(row)
     db.commit()
@@ -641,6 +757,21 @@ def update_software(body: AnyBody, db: Session = Depends(get_db), user: AdminUse
     if not valid_sha256(data.get("sha256")):
         return fail("SHA-256 必须是 64 位十六进制字符串")
     row = get_software_or_404(db, user, data.get("softwareId", ""))
+    try:
+        minimum_protocol = int(data.get("minimumProtocolVersion", row.minimum_protocol_version))
+        lease_ttl = int(data.get("leaseTtlSeconds", row.lease_ttl_seconds))
+        next_check = int(data.get("nextCheckAfterSeconds", row.next_check_after_seconds))
+    except (TypeError, ValueError):
+        return fail("协议策略必须是整数")
+    if minimum_protocol not in {1, 2} or not 30 <= lease_ttl <= 900 or not 10 <= next_check <= lease_ttl:
+        return fail("协议策略超出允许范围")
+    policy_changed = any(
+        (
+            minimum_protocol != row.minimum_protocol_version,
+            lease_ttl != row.lease_ttl_seconds,
+            next_check != row.next_check_after_seconds,
+        )
+    )
     mapping = {
         "name": "name",
         "version": "version",
@@ -655,6 +786,13 @@ def update_software(body: AnyBody, db: Session = Depends(get_db), user: AdminUse
     for key, attr in mapping.items():
         if key in data:
             setattr(row, attr, data[key])
+    row.minimum_protocol_version = minimum_protocol
+    row.lease_ttl_seconds = lease_ttl
+    row.next_check_after_seconds = next_check
+    row.offline_grace_seconds = 0
+    row.device_proof_required = True
+    if policy_changed:
+        row.policy_version = (row.policy_version or 1) + 1
     row.updated_at = datetime.utcnow()
     if not row.instance_key:
         row.instance_key = random_code("IK", 32)
@@ -679,6 +817,8 @@ def del_software(body: AnyBody, db: Session = Depends(get_db), user: AdminUser =
     db.query(AuthCard).filter(AuthCard.software_id == row.software_id).delete()
     db.query(CloudVariable).filter(CloudVariable.owner_id == row.owner_id, CloudVariable.software_id == row.software_id).delete()
     db.query(BlackWhiteItem).filter(BlackWhiteItem.owner_id == row.owner_id, BlackWhiteItem.software_id == row.software_id).delete()
+    db.query(LicenseRequestNonce).filter(LicenseRequestNonce.software_id == row.software_id).delete()
+    db.query(LicenseAuditEvent).filter(LicenseAuditEvent.software_id == row.software_id).delete()
     db.delete(row)
     db.commit()
     return ok()
@@ -721,10 +861,13 @@ def create_auth(body: AnyBody, db: Session = Depends(get_db), user: AdminUser = 
             return fail("绑定次数不能小于 0")
     rows = []
     for _ in range(count):
+        raw_license_key = random_code("KM", 20)
         row = AuthCard(
             owner_id=software.owner_id,
             software_id=software.software_id,
-            auth_id=random_code("KM", 20),
+            auth_id=random_code("CARD_", 24),
+            license_lookup=license_lookup_value(raw_license_key),
+            license_last4=license_last4(raw_license_key),
             creator_id=user.id,
             creator_user=user.user,
             creator_role=normalize_role(user.role),
@@ -735,15 +878,15 @@ def create_auth(body: AnyBody, db: Session = Depends(get_db), user: AdminUser = 
             remark=data.get("remark") or "",
         )
         db.add(row)
-        rows.append(row)
+        rows.append((row, raw_license_key))
     db.commit()
-    return ok([auth_dict(row) for row in rows], "创建成功")
+    return ok([auth_dict(row, issued_license_key=raw_license_key) for row, raw_license_key in rows], "创建成功")
 
 
 @app.post("/api/adm/editAuth")
 def edit_auth(body: AnyBody, db: Session = Depends(get_db), user: AdminUser = Depends(require_permission("authUnbind"))):
     data = body_dict(body)
-    row = visible_auth_query(db, user).filter(AuthCard.auth_id == data.get("authId")).first()
+    row = visible_auth_card(db, user, data.get("cardRef") or data.get("authId"))
     if not row:
         return fail("卡密不存在")
     row.bind_count = data.get("bindCount")
@@ -754,7 +897,7 @@ def edit_auth(body: AnyBody, db: Session = Depends(get_db), user: AdminUser = De
 @app.post("/api/adm/commitUnBind")
 def commit_unbind(body: AnyBody, request: Request, db: Session = Depends(get_db), user: AdminUser = Depends(require_permission("authUnbind"))):
     data = body_dict(body)
-    row = visible_auth_query(db, user).filter(AuthCard.auth_id == data.get("authId")).first()
+    row = visible_auth_card(db, user, data.get("cardRef") or data.get("authId"))
     if not row:
         return fail("卡密不存在")
     row.macid = data.get("macid") or None
@@ -763,6 +906,9 @@ def commit_unbind(body: AnyBody, request: Request, db: Session = Depends(get_db)
         row.status = "unused"
     else:
         row.status = "active"
+    row.device_public_key = None
+    row.device_key_thumbprint = None
+    row.protocol_version = 1
     add_event(
         db,
         row.owner_id,
@@ -771,7 +917,7 @@ def commit_unbind(body: AnyBody, request: Request, db: Session = Depends(get_db)
         "管理员显式解绑" if row.macid is None else "管理员显式换绑",
         request,
         software_id=row.software_id,
-        auth_id=credential_hint(row.auth_id),
+        auth_id=f"ref:{row.auth_id}:last4:{row.license_last4}",
         macid=row.macid,
     )
     db.commit()
@@ -780,10 +926,12 @@ def commit_unbind(body: AnyBody, request: Request, db: Session = Depends(get_db)
 
 @app.post("/api/adm/revokeAuth")
 def revoke_auth(body: AnyBody, request: Request, db: Session = Depends(get_db), user: AdminUser = Depends(require_permission("authUnbind"))):
-    row = visible_auth_query(db, user).filter(AuthCard.auth_id == body_dict(body).get("authId")).first()
+    data = body_dict(body)
+    row = visible_auth_card(db, user, data.get("cardRef") or data.get("authId"))
     if not row:
         return fail("卡密不存在")
     row.status = "revoked"
+    row.revoked_at = datetime.utcnow()
     add_event(
         db,
         row.owner_id,
@@ -792,7 +940,7 @@ def revoke_auth(body: AnyBody, request: Request, db: Session = Depends(get_db), 
         "卡密已撤销",
         request,
         software_id=row.software_id,
-        auth_id=credential_hint(row.auth_id),
+        auth_id=f"ref:{row.auth_id}:last4:{row.license_last4}",
         macid=row.macid,
     )
     db.commit()
@@ -802,7 +950,7 @@ def revoke_auth(body: AnyBody, request: Request, db: Session = Depends(get_db), 
 @app.post("/api/adm/updateAuthRemark")
 def update_auth_remark(body: AnyBody, db: Session = Depends(get_db), user: AdminUser = Depends(require_permission("authUnbind"))):
     data = body_dict(body)
-    row = visible_auth_query(db, user).filter(AuthCard.auth_id == data.get("authId")).first()
+    row = visible_auth_card(db, user, data.get("cardRef") or data.get("authId"))
     if not row:
         return fail("卡密不存在")
     row.remark = data.get("remark") or ""
@@ -813,7 +961,7 @@ def update_auth_remark(body: AnyBody, db: Session = Depends(get_db), user: Admin
 @app.post("/api/adm/delAuth")
 def del_auth(body: AnyBody, db: Session = Depends(get_db), user: AdminUser = Depends(require_permission("authDelete"))):
     data = body_dict(body)
-    row = visible_auth_query(db, user).filter(AuthCard.auth_id == data.get("authId")).first()
+    row = visible_auth_card(db, user, data.get("cardRef") or data.get("authId"))
     if row:
         db.delete(row)
         db.commit()
@@ -825,7 +973,9 @@ def batch_del_auth(body: AnyBody, db: Session = Depends(get_db), user: AdminUser
     data = body_dict(body)
     ids = data.get("list") or []
     visible_ids = visible_software_ids(db, user)
-    db.query(AuthCard).filter(AuthCard.software_id.in_(visible_ids or [""]), AuthCard.auth_id.in_(ids)).delete(synchronize_session=False)
+    conditions = [auth_reference_filter(value) for value in ids if text_value(value)]
+    if conditions:
+        db.query(AuthCard).filter(AuthCard.software_id.in_(visible_ids or [""]), or_(*conditions)).delete(synchronize_session=False)
     db.commit()
     return ok()
 
@@ -837,9 +987,9 @@ def export_table(body: AnyBody, db: Session = Depends(get_db), user: AdminUser =
     q = apply_auth_filters(q, data)
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(["authId", "softwareId", "status", "macid", "endTime", "remark", "creatorUser", "creatorRole"])
+    writer.writerow(["cardRef", "licenseLast4", "softwareId", "status", "macid", "endTime", "remark", "creatorUser", "creatorRole"])
     for row in q.order_by(AuthCard.created_at.desc()).all():
-        writer.writerow([row.auth_id, row.software_id, row.status, row.macid or "", row.end_time or "", row.remark, row.creator_user or "", row.creator_role or ""])
+        writer.writerow([row.auth_id, row.license_last4, row.software_id, row.status, row.macid or "", row.end_time or "", row.remark, row.creator_user or "", row.creator_role or ""])
     buffer.seek(0)
     return StreamingResponse(iter([buffer.getvalue()]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=auth_cards.csv"})
 
@@ -850,7 +1000,9 @@ def assign_auth_to_sub_user(body: AnyBody, db: Session = Depends(get_db), user: 
     sub = data.get("subUserName")
     ids = data.get("authIds") or []
     visible_ids = visible_software_ids(db, user)
-    db.query(AuthCard).filter(AuthCard.software_id.in_(visible_ids or [""]), AuthCard.auth_id.in_(ids)).update({"assigned_sub_user": sub}, synchronize_session=False)
+    conditions = [auth_reference_filter(value) for value in ids if text_value(value)]
+    if conditions:
+        db.query(AuthCard).filter(AuthCard.software_id.in_(visible_ids or [""]), or_(*conditions)).update({"assigned_sub_user": sub}, synchronize_session=False)
     db.commit()
     return ok({"assigned": len(ids)}, "分配成功")
 
@@ -949,6 +1101,37 @@ def message_event(body: AnyBody, db: Session = Depends(get_db), user: AdminUser 
     if end:
         q = q.filter(EventLog.created_at <= end)
     return ok(paged(q, data.get("page"), event_dict))
+
+
+@app.post("/api/adm/licenseAuditList")
+def license_audit_list(body: AnyBody, db: Session = Depends(get_db), user: AdminUser = Depends(require_permission("eventView"))):
+    data = body_dict(body)
+    visible_ids = visible_software_ids(db, user)
+    q = db.query(LicenseAuditEvent).filter(
+        LicenseAuditEvent.owner_id == owner_id_for(user),
+        LicenseAuditEvent.software_id.in_(visible_ids or [""]),
+    )
+    if data.get("softwareId"):
+        q = q.filter(LicenseAuditEvent.software_id == text_value(data["softwareId"]))
+    if data.get("resultCode"):
+        q = q.filter(LicenseAuditEvent.result_code == text_value(data["resultCode"]))
+    if data.get("keyword"):
+        keyword = f"%{text_value(data['keyword'])}%"
+        q = q.filter(
+            or_(
+                LicenseAuditEvent.request_id.like(keyword),
+                LicenseAuditEvent.license_ref.like(keyword),
+                LicenseAuditEvent.license_last4.like(keyword),
+                LicenseAuditEvent.installation_hash.like(keyword),
+                LicenseAuditEvent.device_key_thumbprint.like(keyword),
+            )
+        )
+    start, end = parse_time_range(data.get("time"))
+    if start:
+        q = q.filter(LicenseAuditEvent.created_at >= start)
+    if end:
+        q = q.filter(LicenseAuditEvent.created_at <= end)
+    return ok(paged(q.order_by(LicenseAuditEvent.created_at.desc()), data.get("page"), license_audit_dict))
 
 
 @app.post("/api/adm/message/list")
@@ -1095,8 +1278,8 @@ def credential_hint(value: Any) -> str:
     raw = str(value or "")
     if not raw:
         return "missing"
-    digest = hashlib.sha256(raw.encode()).hexdigest()[:12]
-    return f"sha256:{digest}:last4:{raw[-4:]}"
+    digest = license_lookup_value(raw)[:12]
+    return f"hmac:{digest}:last4:{raw[-4:]}"
 
 
 def utc_text(value: datetime | None = None) -> str:
@@ -1148,7 +1331,7 @@ def validate_license_card(
 
     card = (
         db.query(AuthCard)
-        .filter(AuthCard.auth_id == license_key, AuthCard.software_id == soft.software_id)
+        .filter(AuthCard.license_lookup == license_lookup_value(license_key), AuthCard.software_id == soft.software_id)
         .with_for_update()
         .first()
     )
@@ -1184,6 +1367,7 @@ def validate_license_card(
                     "status": "active",
                     "activated_at": card.activated_at or now,
                     "end_time": end_time,
+                    "protocol_version": 1,
                 },
                 synchronize_session=False,
             )
@@ -1245,12 +1429,193 @@ def legacy_license_failure(
     return fail(message, error_code=code)
 
 
+def add_v2_audit(
+    db: Session,
+    request: Request,
+    request_id: str,
+    data: dict[str, Any],
+    result_code: str,
+    *,
+    owner_id: int | None = None,
+    card: AuthCard | None = None,
+    device_thumbprint: str | None = None,
+) -> None:
+    installation_id = str(data.get("installationId") or "")
+    db.add(
+        LicenseAuditEvent(
+            owner_id=owner_id,
+            request_id=request_id,
+            software_id=str(data.get("softwareId") or "")[:80],
+            license_ref=card.auth_id if card else None,
+            license_last4=card.license_last4 if card else license_last4(str(data.get("licenseKey") or "")),
+            installation_hash=hashlib.sha256(installation_id.encode("utf-8")).hexdigest() if installation_id else "",
+            device_key_thumbprint=device_thumbprint,
+            client_version=str(data.get("clientVersion") or "")[:80],
+            protocol_version=2,
+            result_code=result_code,
+            source_ip=request_ip(request),
+        )
+    )
+
+
+def consume_v2_nonce(db: Session, data: dict[str, Any], request_id: str, now: datetime) -> bool:
+    nonce_raw = b64url_decode(data["requestNonce"])
+    if not 24 <= len(nonce_raw) <= 64:
+        raise ValueError("nonce length")
+    nonce_hash = hashlib.sha256(nonce_raw).hexdigest()
+    existing = db.query(LicenseRequestNonce).filter(LicenseRequestNonce.nonce_hash == nonce_hash).first()
+    if existing and existing.expires_at > now:
+        return False
+    if existing:
+        db.delete(existing)
+        db.flush()
+    db.add(
+        LicenseRequestNonce(
+            nonce_hash=nonce_hash,
+            software_id=data["softwareId"],
+            request_id=request_id,
+            expires_at=now + timedelta(seconds=get_settings().license_nonce_ttl_seconds),
+        )
+    )
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        return False
+    return True
+
+
+def cleanup_license_protocol_records(db: Session, now: datetime) -> None:
+    db.query(LicenseRequestNonce).filter(LicenseRequestNonce.expires_at <= now).delete(synchronize_session=False)
+    audit_cutoff = now - timedelta(days=get_settings().license_audit_retention_days)
+    db.query(LicenseAuditEvent).filter(LicenseAuditEvent.created_at < audit_cutoff).delete(synchronize_session=False)
+
+
+def validate_v2_card(
+    db: Session,
+    soft: SoftwareInstance,
+    license_key: str,
+    installation_id: str,
+    device_public_key: str,
+    device_thumbprint: str,
+    update_required: bool,
+) -> tuple[AuthCard | None, LicenseFailure | None]:
+    card = (
+        db.query(AuthCard)
+        .filter(
+            AuthCard.license_lookup == license_lookup_value(license_key),
+            AuthCard.software_id == soft.software_id,
+        )
+        .with_for_update()
+        .first()
+    )
+    if not card:
+        return None, ("LICENSE_NOT_FOUND", "卡密不存在", 404)
+    if card.status in {"disabled", "revoked"}:
+        return card, ("LICENSE_REVOKED", "卡密已禁用或撤销", 403)
+    now = datetime.utcnow()
+    if card.status == "expired" or (card.end_time and card.end_time <= now):
+        return card, ("LICENSE_EXPIRED", "卡密已过期", 403)
+    allowed, reason = check_black_white(db, card.owner_id, card.software_id, installation_id)
+    if not allowed:
+        return card, ("LICENSE_DEVICE_BLOCKED", reason, 403)
+    if update_required:
+        return card, ("CLIENT_UPDATE_REQUIRED", "客户端版本低于最低要求", 426)
+
+    if card.status == "unused":
+        if card.macid and not hmac.compare_digest(card.macid, installation_id):
+            return card, ("LICENSE_DEVICE_MISMATCH", "卡密已绑定其他设备", 409)
+        duration = auth_duration(card)
+        end_time = card.end_time or (now + duration if duration else None)
+        updated = (
+            db.query(AuthCard)
+            .filter(
+                AuthCard.id == card.id,
+                AuthCard.status == "unused",
+                or_(AuthCard.macid.is_(None), AuthCard.macid == "", AuthCard.macid == installation_id),
+                or_(AuthCard.device_key_thumbprint.is_(None), AuthCard.device_key_thumbprint == ""),
+            )
+            .update(
+                {
+                    "macid": installation_id,
+                    "device_public_key": device_public_key,
+                    "device_key_thumbprint": device_thumbprint,
+                    "status": "active",
+                    "protocol_version": 2,
+                    "activated_at": card.activated_at or now,
+                    "end_time": end_time,
+                },
+                synchronize_session=False,
+            )
+        )
+        if updated != 1:
+            db.expire_all()
+            winner = db.query(AuthCard).filter(AuthCard.id == card.id).first()
+            if (
+                winner
+                and winner.status == "active"
+                and winner.macid == installation_id
+                and winner.device_key_thumbprint == device_thumbprint
+                and winner.device_public_key == device_public_key
+            ):
+                return winner, None
+            return winner, ("LICENSE_DEVICE_MISMATCH", "卡密已由其他设备激活", 409)
+        db.expire(card)
+        db.refresh(card)
+        return card, None
+
+    if card.status != "active":
+        return card, ("LICENSE_INVALID_STATE", "卡密状态无效", 409)
+    if not card.macid or not hmac.compare_digest(card.macid, installation_id):
+        return card, ("LICENSE_DEVICE_MISMATCH", "卡密已绑定其他设备", 409)
+
+    # A v1-bound card may claim its device key once during the explicit migration window.
+    if not card.device_key_thumbprint and not card.device_public_key:
+        claimed = (
+            db.query(AuthCard)
+            .filter(
+                AuthCard.id == card.id,
+                AuthCard.status == "active",
+                AuthCard.macid == installation_id,
+                AuthCard.device_key_thumbprint.is_(None),
+                AuthCard.device_public_key.is_(None),
+            )
+            .update(
+                {
+                    "device_public_key": device_public_key,
+                    "device_key_thumbprint": device_thumbprint,
+                    "protocol_version": 2,
+                },
+                synchronize_session=False,
+            )
+        )
+        if claimed == 1:
+            db.expire(card)
+            db.refresh(card)
+            return card, None
+        db.expire_all()
+        card = db.query(AuthCard).filter(AuthCard.id == card.id).first()
+
+    if (
+        not card
+        or not card.device_key_thumbprint
+        or not hmac.compare_digest(card.device_key_thumbprint, device_thumbprint)
+        or not card.device_public_key
+        or not hmac.compare_digest(card.device_public_key, device_public_key)
+    ):
+        return card, ("LICENSE_DEVICE_MISMATCH", "卡密已绑定其他设备", 409)
+    card.protocol_version = 2
+    return card, None
+
+
 @app.post("/api/client/software/checkUpdate", deprecated=True)
 def client_check_update(body: AnyBody, request: Request, db: Session = Depends(get_db)):
     data = body_dict(body)
     soft, error = client_software_or_fail(db, data)
     if not soft:
         return fail(error, error_code="INSTANCE_KEY_INVALID" if error == "实例密钥错误" else "SOFTWARE_NOT_FOUND")
+    if soft.minimum_protocol_version >= 2:
+        return api_error("PROTOCOL_UPGRADE_REQUIRED", "该实例要求使用 v2 授权协议", 426, request_id=new_request_id())
     version_data = update_result(soft, str(data.get("version") or ""))
     if not version_data:
         return fail("客户端版本格式错误", error_code="CLIENT_VERSION_INVALID")
@@ -1273,6 +1638,8 @@ def client_auth_activate(body: AnyBody, request: Request, db: Session = Depends(
     soft, error = client_software_or_fail(db, data)
     if not soft:
         return fail(error, error_code="INSTANCE_KEY_INVALID" if error == "实例密钥错误" else "SOFTWARE_NOT_FOUND")
+    if soft.minimum_protocol_version >= 2:
+        return api_error("PROTOCOL_UPGRADE_REQUIRED", "该实例要求使用 v2 授权协议", 426, request_id=new_request_id())
     license_key = text_value(data.get("authId"))
     installation_id = text_value(data.get("macid"))
     card, failure = validate_license_card(db, soft, license_key, installation_id, activate_unused=True)
@@ -1293,6 +1660,8 @@ def client_auth_verify(body: AnyBody, request: Request, db: Session = Depends(ge
     soft, error = client_software_or_fail(db, data)
     if not soft:
         return fail(error, error_code="INSTANCE_KEY_INVALID" if error == "实例密钥错误" else "SOFTWARE_NOT_FOUND")
+    if soft.minimum_protocol_version >= 2:
+        return api_error("PROTOCOL_UPGRADE_REQUIRED", "该实例要求使用 v2 授权协议", 426, request_id=new_request_id())
     license_key = text_value(data.get("authId"))
     installation_id = text_value(data.get("macid"))
     card, failure = validate_license_card(db, soft, license_key, installation_id, activate_unused=False)
@@ -1310,6 +1679,8 @@ def client_auth_unbind(body: AnyBody, request: Request, db: Session = Depends(ge
     soft, error = client_software_or_fail(db, data)
     if not soft:
         return fail(error, error_code="INSTANCE_KEY_INVALID" if error == "实例密钥错误" else "SOFTWARE_NOT_FOUND")
+    if soft.minimum_protocol_version >= 2:
+        return api_error("PROTOCOL_UPGRADE_REQUIRED", "该实例要求使用 v2 授权协议", 426, request_id=new_request_id())
     license_key = text_value(data.get("authId"))
     installation_id = text_value(data.get("macid"))
     card, failure = validate_license_card(db, soft, license_key, installation_id, activate_unused=False)
@@ -1318,6 +1689,9 @@ def client_auth_unbind(body: AnyBody, request: Request, db: Session = Depends(ge
     assert card is not None
     card.macid = None
     card.status = "unused"
+    card.device_public_key = None
+    card.device_key_thumbprint = None
+    card.protocol_version = 1
     audit_license_result(db, request, soft, "unbind", license_key, installation_id, success=True, message="解绑成功")
     db.commit()
     return ok(auth_dict(card))
@@ -1334,9 +1708,14 @@ def client_license_validate(body: LicenseValidateBody, request: Request, db: Ses
     soft = db.query(SoftwareInstance).filter(SoftwareInstance.software_id == data["softwareId"]).first()
     if not soft:
         return api_error("SOFTWARE_NOT_FOUND", "实例不存在", 404)
+    if soft.minimum_protocol_version >= 2:
+        return api_error("PROTOCOL_UPGRADE_REQUIRED", "该实例要求使用 v2 授权协议", 426, request_id=new_request_id())
     version_data = update_result(soft, data["clientVersion"])
     if not version_data:
         return api_error("CLIENT_VERSION_INVALID", "客户端版本格式错误", 422)
+    soft.last_protocol_version = 1
+    soft.last_client_version = data["clientVersion"]
+    soft.last_protocol_at = datetime.utcnow()
 
     card, failure = validate_license_card(
         db,
@@ -1384,6 +1763,161 @@ def client_license_validate(body: LicenseValidateBody, request: Request, db: Ses
         "requiresOnline": True,
     }
     payload.update(version_data)
+    return ok(payload)
+
+
+@app.post("/api/client/v2/license/validate")
+def client_license_validate_v2(body: LicenseValidateV2Body, request: Request, db: Session = Depends(get_db)):
+    data = body.model_dump()
+    request_id = new_request_id()
+    settings = get_settings()
+    source_ip = request_ip(request) or "unknown"
+    license_rate_key = license_lookup_value(data["licenseKey"])
+    installation_rate_key = hashlib.sha256(data["installationId"].encode("utf-8")).hexdigest()
+    rate_checks = (
+        (f"license-v2-ip:{source_ip}", 60, 60),
+        (f"license-v2-software:{data['softwareId']}", 600, 60),
+        (f"license-v2-card:{license_rate_key}", 20, 60),
+        (f"license-v2-installation:{installation_rate_key}", 20, 60),
+    )
+    if not all(rate_limiter.allow(key, limit, window) for key, limit, window in rate_checks):
+        return api_error("RATE_LIMITED", "请求过于频繁", 429, retryable=True, request_id=request_id)
+
+    now_aware = datetime.now(timezone.utc)
+    now = now_aware.replace(tzinfo=None)
+    try:
+        request_time = datetime.fromisoformat(data["requestTime"].replace("Z", "+00:00"))
+    except ValueError:
+        return api_error("INVALID_REQUEST", "请求时间格式错误", 422, request_id=request_id)
+    if abs((now_aware - request_time).total_seconds()) > settings.license_request_window_seconds:
+        add_v2_audit(db, request, request_id, data, "REQUEST_EXPIRED")
+        db.commit()
+        return api_error("REQUEST_EXPIRED", "请求时间已超出允许窗口", 401, request_id=request_id)
+
+    try:
+        canonical = canonical_device_message(
+            data["softwareId"],
+            data["licenseKey"],
+            data["installationId"],
+            data["clientVersion"],
+            data["devicePublicKey"],
+            data["requestNonce"],
+            data["requestTime"],
+        )
+        device_key_thumbprint = verify_device_signature(data["devicePublicKey"], data["deviceSignature"], canonical)
+    except ValueError:
+        add_v2_audit(db, request, request_id, data, "DEVICE_PROOF_INVALID")
+        db.commit()
+        return api_error("DEVICE_PROOF_INVALID", "设备证明无效", 401, request_id=request_id)
+
+    cleanup_license_protocol_records(db, now)
+    try:
+        nonce_accepted = consume_v2_nonce(db, data, request_id, now)
+    except ValueError:
+        add_v2_audit(db, request, request_id, data, "INVALID_REQUEST", device_thumbprint=device_key_thumbprint)
+        db.commit()
+        return api_error("INVALID_REQUEST", "nonce 格式错误", 422, request_id=request_id)
+    if not nonce_accepted:
+        add_v2_audit(db, request, request_id, data, "REQUEST_REPLAYED", device_thumbprint=device_key_thumbprint)
+        db.commit()
+        return api_error("REQUEST_REPLAYED", "请求 nonce 已使用", 409, request_id=request_id)
+
+    soft = db.query(SoftwareInstance).filter(SoftwareInstance.software_id == data["softwareId"]).first()
+    if not soft:
+        add_v2_audit(db, request, request_id, data, "SOFTWARE_NOT_FOUND", device_thumbprint=device_key_thumbprint)
+        db.commit()
+        return api_error("SOFTWARE_NOT_FOUND", "实例不存在", 404, request_id=request_id)
+
+    version_data = update_result(soft, data["clientVersion"])
+    if not version_data:
+        add_v2_audit(db, request, request_id, data, "INVALID_REQUEST", owner_id=soft.owner_id, device_thumbprint=device_key_thumbprint)
+        db.commit()
+        return api_error("INVALID_REQUEST", "客户端版本格式错误", 422, request_id=request_id)
+
+    card, failure = validate_v2_card(
+        db,
+        soft,
+        data["licenseKey"],
+        data["installationId"],
+        data["devicePublicKey"],
+        device_key_thumbprint,
+        version_data["updateRequired"],
+    )
+    if failure:
+        code, message, status_code = failure
+        if not rate_limiter.allow(f"license-v2-failure:{license_rate_key}", 10, 3600):
+            code, message, status_code = "RATE_LIMITED", "失败请求过于频繁", 429
+        add_v2_audit(
+            db,
+            request,
+            request_id,
+            data,
+            code,
+            owner_id=soft.owner_id,
+            card=card,
+            device_thumbprint=device_key_thumbprint,
+        )
+        db.commit()
+        return api_error(code, message, status_code, retryable=code == "RATE_LIMITED", request_id=request_id)
+
+    assert card is not None
+    issued_at = int(now_aware.timestamp())
+    lease_expires = now_aware + timedelta(seconds=soft.lease_ttl_seconds)
+    claims = {
+        "iss": settings.public_base_url,
+        "aud": soft.software_id,
+        "sub": card.auth_id,
+        "installationId": data["installationId"],
+        "deviceKeyThumbprint": device_key_thumbprint,
+        "clientVersion": data["clientVersion"],
+        "status": "active",
+        "iat": issued_at,
+        "nbf": issued_at,
+        "exp": int(lease_expires.timestamp()),
+        "jti": secrets.token_hex(16),
+        "protocolVersion": 2,
+        "policyVersion": soft.policy_version,
+        "updateAvailable": version_data["updateAvailable"],
+        "updateRequired": version_data["updateRequired"],
+        "latestVersion": version_data["latestVersion"],
+        "minimumVersion": version_data["minimumVersion"],
+    }
+    try:
+        lease_token = sign_jws(claims)
+    except Exception:
+        db.rollback()
+        return api_error("SERVICE_UNAVAILABLE", "授权签名服务暂不可用", 503, retryable=True, request_id=request_id)
+
+    soft.visit += 1
+    soft.lasttime = now
+    soft.last_protocol_version = 2
+    soft.last_client_version = data["clientVersion"]
+    soft.last_protocol_at = now
+    add_v2_audit(
+        db,
+        request,
+        request_id,
+        data,
+        "LICENSE_VALID",
+        owner_id=soft.owner_id,
+        card=card,
+        device_thumbprint=device_key_thumbprint,
+    )
+    db.commit()
+    payload = {
+        "status": "active",
+        "expiresAt": utc_text(card.end_time) if card.end_time else None,
+        "serverTime": utc_text(now_aware),
+        "nextCheckAfterSeconds": soft.next_check_after_seconds,
+        "offlineGraceSeconds": 0,
+        "requiresOnline": True,
+        "leaseExpiresAt": utc_text(lease_expires),
+        "leaseToken": lease_token,
+        "updateAvailable": version_data["updateAvailable"],
+        "updateRequired": version_data["updateRequired"],
+        "latestVersion": version_data["latestVersion"],
+        "minimumVersion": version_data["minimumVersion"],
+    }
     return ok(payload)
 
 

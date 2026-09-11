@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 
-from .models import AdminUser, AuthCard, BlackWhiteItem, CloudVariable, Customer, EventLog, Message, SoftwareInstance
+from .models import AdminUser, AuthCard, BlackWhiteItem, CloudVariable, Customer, EventLog, LicenseAuditEvent, Message, SoftwareInstance
 from .security import normalize_role, role_label, role_permissions, ROLE_USER
 from .utils import now_text
 
@@ -57,6 +57,15 @@ def software_dict(row: SoftwareInstance, include_secret: bool = False) -> dict:
         "sha256": row.sha256,
         "protocolVersion": row.protocol_version,
         "strictClientAuth": row.strict_client_auth,
+        "minimumProtocolVersion": row.minimum_protocol_version,
+        "leaseTtlSeconds": row.lease_ttl_seconds,
+        "nextCheckAfterSeconds": row.next_check_after_seconds,
+        "offlineGraceSeconds": row.offline_grace_seconds,
+        "deviceProofRequired": row.device_proof_required,
+        "policyVersion": row.policy_version,
+        "lastProtocolVersion": row.last_protocol_version,
+        "lastClientVersion": row.last_client_version,
+        "lastProtocolAt": now_text(row.last_protocol_at),
         "createTime": now_text(row.created_at),
         "lasttime": now_text(row.lasttime or row.updated_at),
     }
@@ -65,7 +74,7 @@ def software_dict(row: SoftwareInstance, include_secret: bool = False) -> dict:
     return data
 
 
-def auth_dict(row: AuthCard) -> dict:
+def auth_dict(row: AuthCard, issued_license_key: str | None = None) -> dict:
     creator_name = ""
     if row.creator:
         creator_name = row.creator.nick or row.creator.user
@@ -73,7 +82,9 @@ def auth_dict(row: AuthCard) -> dict:
     return {
         "_id": str(row.id),
         "id": row.id,
-        "authId": row.auth_id,
+        "authId": issued_license_key or row.auth_id,
+        "cardRef": row.auth_id,
+        "licenseLast4": row.license_last4,
         "softwareId": row.software_id,
         "status": row.status == "active",
         "state": row.status,
@@ -93,6 +104,9 @@ def auth_dict(row: AuthCard) -> dict:
         "creatorRoleLabel": role_label(row.creator_role or ROLE_USER),
         "createTime": now_text(row.created_at),
         "activatedAt": now_text(row.activated_at),
+        "deviceKeyThumbprint": row.device_key_thumbprint,
+        "protocolVersion": row.protocol_version,
+        "revokedAt": now_text(row.revoked_at),
     }
 
 
@@ -141,6 +155,24 @@ def event_dict(row: EventLog) -> dict:
         "ip": row.ip,
         "result": row.result,
         "message": row.message,
+        "createTime": now_text(row.created_at),
+    }
+
+
+def license_audit_dict(row: LicenseAuditEvent) -> dict:
+    return {
+        "id": row.id,
+        "requestId": row.request_id,
+        "eventType": row.event_type,
+        "softwareId": row.software_id,
+        "licenseRef": row.license_ref,
+        "licenseLast4": row.license_last4,
+        "installationHash": row.installation_hash,
+        "deviceKeyThumbprint": row.device_key_thumbprint,
+        "clientVersion": row.client_version,
+        "protocolVersion": row.protocol_version,
+        "resultCode": row.result_code,
+        "sourceIp": row.source_ip,
         "createTime": now_text(row.created_at),
     }
 

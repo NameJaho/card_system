@@ -157,6 +157,7 @@ export const api = {
   blackWhiteList: () => request('/api/adm/blackWhiteList', {}),
   saveBlackWhiteList: (body) => request('/api/adm/saveBlackWhiteList', body),
   events: (body) => request('/api/adm/message/event', body),
+  licenseAudits: (body) => request('/api/adm/licenseAuditList', body),
   messages: () => request('/api/adm/message/list', {}),
   sendMessage: (body) => request('/api/adm/message/send', body),
   subUsers: (body) => request('/api/adm/subUserList', body),

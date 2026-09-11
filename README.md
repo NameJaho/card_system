@@ -13,7 +13,7 @@
 - 黑白名单：按实例维护白名单/黑名单，软件侧验证时生效。
 - 事件日志：记录后台登录、软件侧检查更新、激活、验证、解绑、用户注册登录、心跳等事件。
 - 子账户：创建/编辑/删除子账户，分配实例范围和细粒度权限。
-- 软件侧 API：推荐单一幂等 `/api/client/v1/license/validate`；旧检查、激活、验证和解绑接口仅作迁移兼容。
+- 软件侧 API：推荐带 Ed25519 lease 与设备私钥证明的 `/api/client/v2/license/validate`；v1 和更旧接口仅作迁移兼容。
 
 ## 技术栈
 
@@ -57,7 +57,10 @@ npm run dev
 
 ```bash
 cp .env.example .env
-# 编辑 .env，填写 HTTPS 公网地址、CORS，并修改全部 secret 和默认管理员密码
+# 编辑 .env，填写 HTTPS 公网地址、CORS、不可变卡密 pepper，并修改全部 secret 和默认管理员密码
+mkdir -p secrets && chmod 700 secrets
+openssl genpkey -algorithm Ed25519 -out secrets/keydesk-license-ed25519.pem
+chmod 600 secrets/keydesk-license-ed25519.pem
 docker compose up -d --build
 ```
 
@@ -118,6 +121,16 @@ OpenClaw 安装流程见 [docs/openclaw-deploy.md](docs/openclaw-deploy.md)。
 - `CARD_APP_VERSION`：显示在 `/health` 中的发布版本。
 - `CARD_GIT_SHA`：显示在 `/health` 中的发布提交。
 - `CARD_SECRET_KEY`：JWT 签名密钥，生产必须修改。
+- `CARD_LICENSE_SIGNING_KEY_FILE`：容器内 Ed25519 PKCS#8 PEM 私钥路径。
+- `CARD_LICENSE_SIGNING_KEY_FILE_HOST`：宿主机签名私钥路径，默认 `./secrets/keydesk-license-ed25519.pem`。
+- `CARD_LICENSE_SIGNING_KEY_ID`：当前授权签名密钥 ID，生产不得使用开发默认值。
+- `CARD_LICENSE_PREVIOUS_PUBLIC_KEYS`：密钥轮换期继续信任的旧公钥 JSON。
+- `CARD_LICENSE_PEPPER`：卡密 HMAC 查询 secret；首次迁移后必须永久保持不变并纳入灾备。
+- `CARD_LICENSE_LEASE_TTL_SECONDS`：v2 lease 有效期，范围 30～900 秒。
+- `CARD_LICENSE_NEXT_CHECK_SECONDS`：建议客户端在线复验间隔，不得大于 lease TTL。
+- `CARD_LICENSE_REQUEST_WINDOW_SECONDS`：v2 请求时间允许偏差，默认 120 秒。
+- `CARD_LICENSE_NONCE_TTL_SECONDS`：nonce 防重放保存期，默认 600 秒。
+- `CARD_LICENSE_AUDIT_RETENTION_DAYS`：v2 授权审计保留天数，默认 90 天。
 - `CARD_ALLOW_DEV_RESET_LINK`：是否允许找回密码接口直接返回重置 token，生产默认关闭。
 - `CARD_DEFAULT_ADMIN_USER`：初始化管理员账号。
 - `CARD_DEFAULT_ADMIN_PASSWORD`：初始化管理员密码。
@@ -175,10 +188,10 @@ Authorization: Bearer <登录返回的 token>
 
 ## 软件侧 API
 
-新客户端配置只包含 `baseUrl`、`softwareId` 和 `version`，统一调用：
+官方 SDK 2.0.0 的配置只包含 `baseUrl`、`softwareId` 和 `version`；生产服务地址与签名公钥会固化在后台下载的 SDK 中。统一调用：
 
 ```http
-POST /api/client/v1/license/validate
+POST /api/client/v2/license/validate
 ```
 
 Python 入口：
@@ -190,7 +203,7 @@ license = KeyDesk.from_file("keydesk.json")
 license.require_license(prompt=lambda: input("请输入卡密：").strip())
 ```
 
-SDK 自动创建随机 installation ID，并按稳定错误码区分过期、撤销、设备冲突和网络异常。完整契约及旧协议迁移规则见 [docs/client-integration.md](docs/client-integration.md)。
+SDK 自动创建 installation ID 与 Ed25519 设备密钥，签名每次请求，并严格验证官方短期 lease。完整契约、信任边界及 v1 迁移规则见 [docs/client-integration.md](docs/client-integration.md)。
 
 ## 权限说明
 
@@ -216,10 +229,13 @@ blackWhiteView, blackWhiteAdd, blackWhiteDelete
 
 后端测试：
 
-```bash
+```powershell
 cd backend
-pytest
+$env:PYTHONPATH='.'
+pytest -q
 ```
+
+Linux/macOS 使用 `export PYTHONPATH=.` 后运行同一测试命令。
 
 前端构建：
 
@@ -238,7 +254,7 @@ docker compose config
 
 ## 运维建议
 
-- 生产环境务必修改 `CARD_SECRET_KEY` 和默认管理员密码。
+- 生产环境务必修改 `CARD_SECRET_KEY` 和默认管理员密码，并安全备份不可变 `CARD_LICENSE_PEPPER` 与 Ed25519 私钥。
 - 建议使用 HTTPS，可以在 Nginx 前面再接入 Caddy、Traefik 或云厂商负载均衡。
 - 定期备份 `runtime/mysql` 或使用 `mysqldump` 导出数据库。
 - 不要把 `.env`、数据库文件、导出的卡密 CSV 提交到代码仓库。

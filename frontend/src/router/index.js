@@ -24,7 +24,7 @@ const routes = [
   { path: '/evenList', name: 'evenList', component: EventsView, meta: { permission: 'eventView' } },
   { path: '/user', name: 'user', component: ProfileView },
   { path: '/proxy', name: 'proxy', component: ProxyView, meta: { permission: 'accountManage' } },
-  { path: '/client-api', name: 'client-api', component: ClientApiView },
+  { path: '/client-api', name: 'client-api', component: ClientApiView, meta: { permission: 'softView' } },
   { path: '/:pathMatch(.*)*', redirect: '/dashboard' }
 ]
 

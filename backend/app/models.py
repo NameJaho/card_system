@@ -53,6 +53,15 @@ class SoftwareInstance(Base):
     instance_key: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
     protocol_version: Mapped[str] = mapped_column(String(20), default="v1", nullable=False)
     strict_client_auth: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    minimum_protocol_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    lease_ttl_seconds: Mapped[int] = mapped_column(Integer, default=300, nullable=False)
+    next_check_after_seconds: Mapped[int] = mapped_column(Integer, default=60, nullable=False)
+    offline_grace_seconds: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    device_proof_required: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    policy_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    last_protocol_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_client_version: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    last_protocol_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     force: Mapped[bool] = mapped_column(Boolean, default=False)
     remark: Mapped[str] = mapped_column(Text, default="")
     url: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -83,6 +92,8 @@ class AuthCard(Base):
     owner_id: Mapped[int] = mapped_column(ForeignKey("admin_users.id"), index=True)
     software_id: Mapped[str] = mapped_column(String(80), index=True)
     auth_id: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    license_lookup: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    license_last4: Mapped[str] = mapped_column(String(4), nullable=False)
     status: Mapped[str] = mapped_column(String(20), default=AuthStatus.unused.value)
     macid: Mapped[str | None] = mapped_column(String(255), nullable=True)
     bind_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -98,6 +109,10 @@ class AuthCard(Base):
     creator_role: Mapped[str] = mapped_column(String(30), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     activated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    device_public_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    device_key_thumbprint: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    protocol_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     __table_args__ = (UniqueConstraint("owner_id", "auth_id", name="uq_owner_auth_id"),)
 
@@ -180,3 +195,44 @@ class PasswordResetToken(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     user: Mapped[AdminUser] = relationship()
+
+
+class LicenseRequestNonce(Base):
+    __tablename__ = "license_request_nonces"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    nonce_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    software_id: Mapped[str] = mapped_column(String(80), index=True)
+    request_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class LicenseAuditEvent(Base):
+    __tablename__ = "license_audit_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int | None] = mapped_column(ForeignKey("admin_users.id"), nullable=True, index=True)
+    request_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    event_type: Mapped[str] = mapped_column(String(60), default="licenseValidate")
+    software_id: Mapped[str] = mapped_column(String(80), index=True)
+    license_ref: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    license_last4: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    installation_hash: Mapped[str] = mapped_column(String(64), default="")
+    device_key_thumbprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    client_version: Mapped[str] = mapped_column(String(80), default="")
+    protocol_version: Mapped[int] = mapped_column(Integer, default=2)
+    result_code: Mapped[str] = mapped_column(String(80), index=True)
+    source_ip: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class LicenseSigningKey(Base):
+    __tablename__ = "license_signing_keys"
+
+    kid: Mapped[str] = mapped_column(String(80), primary_key=True)
+    public_key: Mapped[str] = mapped_column(String(120), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    not_before: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    not_after: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
